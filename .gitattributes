@@ -1,0 +1,9 @@
+# 源码与文档统一使用 LF 换行。
+* text=auto
+Makefile text eol=lf
+*.py text eol=lf
+*.cpp text eol=lf
+*.cu text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.MD text eol=lf
