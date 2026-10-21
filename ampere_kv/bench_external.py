@@ -75,6 +75,23 @@ def run_ampere(prompts, batch: int, output_tokens: int, repeats: int,
                 with torch.cuda.nvtx.range(f"{stage}:batch={len(group)}"):
                     return super()._decode_batch(group, graph)
 
+            # 这些宿主范围不含选词取回；等待须结合外层 Decode 内的 CUDA API 判读。
+            def _commit(self, request, token):
+                with torch.cuda.nvtx.range("commit"):
+                    return super()._commit(request, token)
+
+            def _retire(self, request):
+                with torch.cuda.nvtx.range("retire"):
+                    return super()._retire(request)
+
+            def _stop_round(self, now):
+                with torch.cuda.nvtx.range("stop_round"):
+                    return super()._stop_round(now)
+
+            def _admit(self):
+                with torch.cuda.nvtx.range("admit"):
+                    return super()._admit()
+
         scheduler_class = TimelineScheduler
     else:
         scheduler_class = Scheduler
