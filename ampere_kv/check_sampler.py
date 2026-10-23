@@ -113,7 +113,8 @@ def check_model():
             self.parameters = {}
 
         def submit(self, request_id, *args, **kwargs):
-            index = int(request_id[1:]) if request_id.startswith("r") else 4
+            # 固定用例按完整ID选参数；replacement不是编号请求。
+            index = {"r0": 0, "r1": 1, "r2": 2, "r3": 3}.get(request_id, 4)
             temperature, k = ((0.7, 7), (1.2, 23), (0.0, -1), (0.9, -1), (1.0, 11))[index]
             if self.force_eos and index == 0:
                 k = 1  # 受控生命周期沿用greedy历史，避免随机EOS早于注入点。
