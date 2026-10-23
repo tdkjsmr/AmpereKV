@@ -28,6 +28,7 @@ class Meter:
         self.samples = []
         self.submitted = self.completed = self.rounds = 0
         self.completed_outputs = 0
+        self.last_ready = None
 
     def bucket(self, now):
         elapsed = now - self.start
@@ -37,6 +38,7 @@ class Meter:
         return self.windows[index]
 
     def ready(self, request, now):
+        self.last_ready = now
         meta = self.live[request.request_id]
         bucket = self.bucket(now)
         bucket["tokens_ready"] += 1
@@ -123,7 +125,7 @@ def scheduler_type():
     return ObservedScheduler
 
 
-def run(scheduler, templates, batch, requests=0, seconds=0, profile=None, observed=True):
+def run(scheduler, templates, batch, requests=0, seconds=0, profile=None, observed=True, pipeline_mode="a"):
     import torch
 
     torch.cuda.synchronize()  # 样本起点排空预热；不在每Token增加同步。
@@ -131,6 +133,12 @@ def run(scheduler, templates, batch, requests=0, seconds=0, profile=None, observ
     meter = Meter(seconds)
     scheduler.meter = meter
     scheduler.tracing = False
+    pipeline = scheduler.decode_pipeline if pipeline_mode != "a" else None
+    if pipeline:
+        assert pipeline.pending is None
+        pipeline.overlap = pipeline_mode == "c"
+        pipeline.stats["max_inflight"] = 0
+    pipeline_before = pipeline.stats.copy() if pipeline else Counter()
     captures = scheduler.graph_captures
     before = (scheduler.graph_calls, scheduler.graph_fallbacks,
               {str(b): g.replays for b, g in (scheduler.graphs or {}).items()})
@@ -173,7 +181,14 @@ def run(scheduler, templates, batch, requests=0, seconds=0, profile=None, observ
             bucket["waiting_max"] = max(bucket["waiting_max"], len(scheduler.waiting))
             bucket["waiting_sum"] += len(scheduler.waiting)
             bucket["running_max"] = max(bucket["running_max"], len(scheduler.running))
-            finished, sizes = scheduler.step()
+            if pipeline:
+                scheduler.batches, scheduler.prefilled, scheduler.retired = [], False, 0
+                pipeline.tracing = scheduler.tracing
+                finished, sizes = pipeline.advance()
+                if not pipeline.used_fallback:
+                    scheduler.batches = pipeline.last_batches
+            else:
+                finished, sizes = scheduler.step()
             ended = time.perf_counter()
             meter.rounds += 1
             bucket["rounds"] += 1
@@ -215,6 +230,10 @@ def run(scheduler, templates, batch, requests=0, seconds=0, profile=None, observ
     assert not scheduler.waiting and not scheduler.running and scheduler.prefilling is None
     assert all(s._pool.num_free_blocks == scheduler.blocks_per_layer for s in scheduler.storages)
     assert scheduler.graph_captures == captures
+    assert pipeline is None or pipeline.pending is None
+    if pipeline:
+        delta = pipeline.stats - pipeline_before
+        assert delta["device_tokens"] == delta["committed_tokens"] + delta["discarded_tokens"]
     if profile:
         assert profile_end is not None, "请求结束前未覆盖所选采集窗口"
     output_tokens = sum(w["tokens_ready"] for w in meter.windows) + meter.drain["tokens_ready"]
@@ -234,6 +253,14 @@ def run(scheduler, templates, batch, requests=0, seconds=0, profile=None, observ
                         "seconds": span, "output_tokens_per_s": bucket["tokens_ready"] / span,
                         "counts": dict(bucket)})
     return {"observation_s": observation, "total_s": ended - meter.start,
+            "pipeline_mode": pipeline_mode,
+            "last_output_s": meter.last_ready - meter.start if meter.last_ready else None,
+            "completion_after_last_output_ms": (ended - meter.last_ready) * 1000 if meter.last_ready else None,
+            "pipeline": {k: pipeline.stats[k] - pipeline_before[k] for k in pipeline.stats
+                         if k != "max_inflight"} | {"max_inflight": pipeline.stats["max_inflight"]} if pipeline else {},
+            "decode_forward_calls": sum(v for w in [*meter.windows, meter.drain] for k, v in w.items()
+                                        if k.endswith("_calls") and k.startswith(("eager_b", "graph_b"))),
+            "prefill_forward_calls": sum(w["prefill_rounds"] for w in [*meter.windows, meter.drain]),
             "drain_s": max(0, ended - meter.start - seconds) if seconds else 0,
             "submitted": meter.submitted, "completed": meter.completed, "rounds": meter.rounds,
             "output_tokens": output_tokens, "completed_output_tokens": meter.completed_outputs,
@@ -260,8 +287,13 @@ def main():
     parser.add_argument("--repeats", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--seconds", type=int, default=600)
     parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--pipeline", choices=("a", "b", "c", "abc"), default="a")
     parser.add_argument("--profile-rounds", nargs=2, type=int, metavar=("START", "COUNT"))
     args = parser.parse_args()
+    if args.pipeline != "a" and (not args.cuda_graph or args.batch not in (1, 4)):
+        parser.error("B/C仅支持显式Graph B1/B4")
+    if args.pipeline == "abc" and (args.mode != "steady" or args.profile_rounds):
+        parser.error("ABC配对仅用于无采集steady；诊断请选择单独C")
     repo = Path(__file__).resolve().parents[1]
     if args.output.resolve().is_relative_to(repo) or args.output.exists():
         parser.error("结果须写到仓库外的新文件，不覆盖旧证据")
@@ -303,15 +335,31 @@ def main():
         for template in templates:
             template["gpu"] = torch.tensor([template.pop("ids")], dtype=torch.long, device="cuda")
         try:
+            init_start = time.perf_counter()
+            init_allocated = torch.cuda.memory_allocated()
             scheduler = scheduler_type()(model, blocks, max_batch=args.batch, mixed=False)
             if args.cuda_graph:
                 capacity = max(t["input_tokens"] + t["outputs"] for t in templates)
                 scheduler.enable_graphs((capacity + 15) // 16 * 16)
+            if args.pipeline != "a":
+                scheduler.enable_pipeline(overlap=args.pipeline == "c")
+            torch.cuda.synchronize()
+            result["initialization"] = {"wall_ms": (time.perf_counter() - init_start) * 1000,
+                                        "allocated_delta": torch.cuda.memory_allocated() - init_allocated,
+                                        "includes": "KV池、Graph及可选流水槽；不计入测量"}
             warm = [t | {"outputs": 8} for t in templates]
-            run(scheduler, warm, args.batch, requests=args.batch)
-            samples = [run(scheduler, templates, args.batch, requests=2 * args.batch if args.mode == "smoke" else args.batch,
-                           seconds=args.seconds if args.mode == "stream" else 0, profile=args.profile_rounds)
-                       for _ in range(1 if args.mode != "steady" or args.profile_rounds else args.repeats)]
+            modes = "abc" if args.pipeline == "abc" else args.pipeline
+            for mode in modes:
+                run(scheduler, warm, args.batch, requests=args.batch, pipeline_mode=mode)
+            samples = []
+            for repeat in range(1 if args.mode != "steady" or args.profile_rounds else args.repeats):
+                for mode in modes[::-1] if repeat % 2 else modes:
+                    samples.append(run(scheduler, templates, args.batch,
+                                       requests=2 * args.batch if args.mode == "smoke" else args.batch,
+                                       seconds=args.seconds if args.mode == "stream" else 0,
+                                       profile=args.profile_rounds, pipeline_mode=mode))
+            if args.pipeline == "abc":
+                assert len({s["output_sha256"] for s in samples}) == 1, "ABC完整输出摘要不同，不报告加速"
             if args.mode == "smoke":
                 reference = Scheduler(model, blocks, max_batch=args.batch, mixed=False)
                 expected = run(reference, templates, args.batch, requests=2 * args.batch, observed=False)
@@ -319,14 +367,18 @@ def main():
                 assert samples[0]["submitted"] > args.batch
                 result["smoke_reference_match"] = True
             result.update(status="passed", samples=samples, profile_diagnostic=bool(args.profile_rounds))
-            result["median_total_ms"] = statistics.median(s["total_s"] * 1000 for s in samples)
+            result["medians_by_pipeline_ms"] = {m: statistics.median(s["total_s"] * 1000 for s in samples
+                                                                       if s["pipeline_mode"] == m) for m in modes}
+            result["median_total_ms"] = result["medians_by_pipeline_ms"][modes] if len(modes) == 1 else None
         except torch.cuda.OutOfMemoryError as exc:
             result.update(status="oom", reason=str(exc))  # 退出本进程，不降批量重试冒充原配置。
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"[结果] {args.run_id} 状态={result['status']}，JSON={args.output}")
     for sample in result.get("samples", []):
-        print(f"[样本] 完成={sample['completed']}，轮次={sample['rounds']}，总秒={sample['total_s']:.3f}，排空秒={sample['drain_s']:.3f}，Graph={sample['graph']}")
+        print(f"[样本] 路径={sample['pipeline_mode']}，完成={sample['completed']}，轮次={sample['rounds']}，总秒={sample['total_s']:.3f}，排空秒={sample['drain_s']:.3f}，Graph={sample['graph']}")
+        if sample["pipeline"]:
+            print(f"[流水] {sample['pipeline']}，Decode前向={sample['decode_forward_calls']}，最后输出秒={sample['last_output_s']:.6f}，输出后收尾ms={sample['completion_after_last_output_ms']:.3f}")
         for window in sample["windows"]:
             print(f"[窗口] {window['phase']} 输出吞吐={window['output_tokens_per_s']:.3f} Token/s，统计={window['counts']}")
     print("[边界] Token按commit入口就绪、轮次按轮首分窗；分类可重叠，profile结果不作正式性能。")

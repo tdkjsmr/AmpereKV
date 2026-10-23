@@ -45,7 +45,7 @@ class CapturedDecode:
                             torch.cuda.memory_reserved() - before[1])
         self.replays = 0
 
-    def upload_metadata(self, caches):
+    def metadata_values(self, caches):
         if any(cache.length >= self.width * cache._key.shape[2] for layer in caches for cache in layer):
             raise ValueError("固定块表容量不足")
         starts, tables = [], []
@@ -55,9 +55,27 @@ class CapturedDecode:
                 row = cache.reserve(1)
                 tables.extend(row)
                 tables.extend([0] * (self.width - len(row)))
+        return starts + tables
+
+    def upload_metadata(self, caches):
         # 前半段按层存起点，后半段按层、请求存块表；当前流一次阻塞上传。
-        host = torch.tensor(starts + tables, dtype=torch.long)
+        host = torch.tensor(self.metadata_values(caches), dtype=torch.long)
         self.metadata_buffer.copy_(host, non_blocking=False)
+
+    def step_device(self, caches, source, slot, initial):
+        """流水专用：调用方持有槽至ready完成，且所有重放在同一计算流排序。"""
+        batch = len(caches[0])
+        positions = [cache.length for cache in caches[0]]
+        values = self.metadata_values(caches) + positions + initial
+        slot.host_meta.copy_(torch.tensor(values, dtype=torch.long))
+        slot.device_meta.copy_(slot.host_meta, non_blocking=True)
+        size = self.metadata_buffer.numel()
+        self.metadata_buffer.copy_(slot.device_meta[:size])
+        self.positions.copy_(slot.device_meta[size:size + batch].view(batch, 1))
+        self.tokens.copy_(source if source is not None else slot.device_meta[-batch:].view(batch, 1))
+        self.graph.replay()
+        self.replays += 1
+        return self.logits
 
     def step(self, caches, tokens, positions):
         self.tokens.copy_(tokens)

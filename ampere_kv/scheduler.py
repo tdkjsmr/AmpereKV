@@ -60,6 +60,7 @@ class Scheduler:
         self.fallback_rounds = 0
         self.graphs = None
         self.graph_calls = self.graph_fallbacks = self.graph_captures = 0
+        self.decode_pipeline = None
         self._submitted = False
         self.blocks_per_layer = blocks_per_layer
         # 每层一份共享物理张量与块池；请求接入时只新建块表，不再分配或复制张量。
@@ -93,6 +94,14 @@ class Scheduler:
         if self.reserved_blocks or any(storage._pool.num_free_blocks != self.blocks_per_layer
                                        for storage in self.storages):
             raise AssertionError("捕获临时块未全部归还")
+
+    def enable_pipeline(self, *, overlap=True):
+        """显式实验入口；B同步控制/C单步流水均保留原step契约。"""
+        if self._submitted or self.graphs is None or self.mixed or self.max_batch not in (1, 4) or self.decode_pipeline:
+            raise ValueError("流水须在首次提交前启用，仅支持已有Graph的BF16/V1 B1/B4，不能mixed")
+        from ampere_kv.async_decode import DecodePipeline
+        self.decode_pipeline = DecodePipeline(self, overlap=overlap)
+        return self.decode_pipeline
 
     def submit(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int,
                ignore_eos: bool = False, deadline: float | None = None) -> Request:
@@ -288,6 +297,8 @@ class Scheduler:
         模拟硬实时，所以轮内到期的请求可能多拿到本轮 Token——这是明示边界。返回的完成请求
         （本轮被停下的加上正常结束的）每轮只交回一次，调度器自己不留历史。
         """
+        if self.decode_pipeline is not None and self.decode_pipeline.pending is not None:
+            raise RuntimeError("有在途Decode；请先调用流水drain，不可混用step推进")
         finished = self._stop_round(time.monotonic())
         if self.mixed and self.prefilling is None:
             # 混合模式在前向之前先试一次准入，块才能与本轮 Decode 合成一次前向；预算判断照旧，
