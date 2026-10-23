@@ -45,6 +45,14 @@ Prefill 产生首个 Token 的 logits，并写入 RoPE 后的 K、未旋转的 V
 
 机制借鉴 DeepInfer 固定版本的设备 Token 接续、当前前向/前轮后处理及延迟释放，独立实现固定身份子集；不依赖 DeepInfer、TileLang 或其完整 ZOS 调度。来源和实测见[DI-02 报告](BENCHMARK.md#di-02受限单步流水消融f5d5c33)。
 
+## 请求级采样
+
+`sampler.py` 的 `RequestSampler` 在请求提交时校验参数。temperature 为0时保留原 argmax、不分配随机缓冲；随机温度支持 FP32 正规正数范围。每个随机请求使用独立 CPU `torch.Generator`，按 max_new_tokens 预生成 FP32 uniform 并上传；GPU 数据区4×N字节，初始化时另有同量CPU临时数据，不改变全局RNG。seed缺省用系统熵选择，请求安全退休时释放GPU缓冲；有在途引用时仍先排空再退休。
+
+位置0是 Prefill 首 Token；同步选词用已提交输出数，C发射用 `flight.targets−1`，不借用KV长度或batch行号。uniform按位置只读，同位置重试/前瞻丢弃不改变其值，回退也不跳号。输入契约为有限BF16/FP32 logits；随机选词在模型Graph外使用FP32稳定softmax，候选按logits降序，同分按Token ID升序，恰好保留k项后归一化，k=1与greedy均选最小ID最大值。逆CDF取首个累计概率严格大于uniform的候选，尾项修正为1。采样Token留在GPU原槽交给下一轮，事件/提交顺序保持。
+
+采样保证仅限同logits/参数/seed/逻辑位置；不同batch GEMM可能改变logits，不能称整模型batch-invariant。机制参考 DeepInfer 固定 `774ce244` 的[请求参数](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/sampling_params.py)和[采样层](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py)的参数/请求种子划分，来源为Apache-2.0；本项目独立实现给定uniform逆CDF，没有复制其源码或移植DeepSelect/DSpark。尚不覆盖随机INT8/V3、mixed、top-p或grammar。
+
 扩展绑定见 `csrc/bindings.cpp`，实现见 `csrc/paged_decode.cu`；Python 调用点在 `runner.py` 与 `paged_cache.py`。INT8 存的是量化 K/V 及各自 scale，权重仍为 BF16。当前 CUDA 扩展按 `setup.py` 编译 `sm_86`，不能把源码中出现其他路径视为跨架构兼容性保证。
 
 检查与测量不属于执行主线：`check_model.py` 提供 CUDA/INT8 模型对照；`check_scheduler.py`、`check_chunked.py`、`check_mixed.py`、`check_graph_scheduler.py` 分别检查调度、分块与停止、混合前向、Graph。HF 逐步对照由 `runner --mode check` 开启，正常生成不执行。`bench_external.py` 提供整批计时、输出核对与可选时间线采集；`paged_decode.py` 提供独立算子数值检查及调用基准。

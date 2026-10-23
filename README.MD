@@ -44,3 +44,11 @@ python -m ampere_kv.runner --mode generate --cache paged
 在 CUDA 环境中运行 `python -m ampere_kv.<模块名>`：`check_scheduler`、`check_chunked`、`check_mixed`、`check_graph_scheduler` 分别检查调度、分块、混合前向与 Graph。离线整批基准使用 `bench_external`，算子调用基准使用 `paged_decode --benchmark`；参数见各自 `--help`。
 
 异步实验代码在 `async_decode.py`，检查入口为 `python -m ampere_kv.check_async_decode`。`bench_workload --mode steady --cuda-graph --pipeline a|b|c|abc` 分别选择原同步、设备接续同步、单步重叠或交错对照；完整命令、输入要求及已测边界见[DI-02 报告](docs/BENCHMARK.md#di-02受限单步流水消融f5d5c33)。此入口需包含该实现的源码，不在上面的固定 `v2.0.1` 标签中。
+
+开发分支可显式随机生成，默认 `temperature=0` 仍为 greedy：
+
+```bash
+python -m ampere_kv.runner --mode generate --cache paged --temperature 0.8 --top-k 40 --seed 42
+```
+
+随机采样仅覆盖 BF16/V1、非 mixed；调度器用 `submit(..., temperature=0.8, top_k=40, seed=42)`，兼容同步与可选 B/C。`top_k=-1` 表示全词表，或取 `1..vocab_size`；seed为 `0..2^32-1`，省略则随机选定（runner打印，调度器可读 `request.sampler.seed`）。相同 logits/参数/seed/逻辑位置可复现，不保证不同批量的模型 logits 或随机生成序列一致，也不保证跨软硬件版本一致；此功能不在固定 `v2.0.1` 标签中。纯采样检查为 `python -m ampere_kv.check_sampler`，加 `--model` 另测短模型集成。

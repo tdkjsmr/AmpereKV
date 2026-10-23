@@ -29,10 +29,11 @@ class CheckedScheduler(Scheduler):
         super()._retire(request)
 
 
-def create(model, mode, lengths, limits, *, force_eos=False, natural_eos=False, capacity=None, prompts=None):
+def create(model, mode, lengths, limits, *, force_eos=False, natural_eos=False, capacity=None, prompts=None,
+           scheduler_type=CheckedScheduler):
     prompts = prompts or [torch.arange(1, n + 1, device="cuda", dtype=torch.long)[None] for n in lengths]
     blocks = sum((p.shape[1] + limit + 16) // 16 for p, limit in zip(prompts, limits))
-    s = CheckedScheduler(model, blocks, max_batch=len(limits), force_eos=force_eos)
+    s = scheduler_type(model, blocks, max_batch=len(limits), force_eos=force_eos)
     maximum = capacity or (max(p.shape[1] + n for p, n in zip(prompts, limits)) + 15) // 16 * 16
     s.enable_graphs(maximum)
     if mode != "a":
@@ -119,9 +120,9 @@ def compare(model, lengths, limits, *, force_eos=False, natural_eos=False, capac
             print(f"[流水] {dict(s.decode_pipeline.stats)}")
 
 
-def check_stop_and_reuse(model):
+def check_stop_and_reuse(model, scheduler_type=CheckedScheduler):
     for mode in "bc":
-        s, requests = create(model, mode, (15, 16, 63, 64), (8, 8, 8, 12))
+        s, requests = create(model, mode, (15, 16, 63, 64), (8, 8, 8, 12), scheduler_type=scheduler_type)
         p = s.decode_pipeline
         p.advance()
         if mode == "c":

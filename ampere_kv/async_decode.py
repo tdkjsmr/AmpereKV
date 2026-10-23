@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import torch
 
+from ampere_kv.sampler import sample_batch
+
 
 @dataclass
 class Flight:
@@ -76,7 +78,8 @@ class DecodePipeline:
         with self.trace(f"pipeline_forward:seq={flight.sequence},batch={len(group)}"), torch.cuda.stream(self.compute_stream):
             logits = s.graphs[len(group)].step_device(
                 caches, previous.slot.sampled_tokens if previous else None, slot, initial)
-            torch.argmax(logits[:, 0], dim=-1, out=slot.sampled_tokens[:, 0])
+            # targets包含本次输出；CPU提交可能落后一轮，不能用len(output_ids)取随机位置。
+            sample_batch(logits[:, 0], group, [t - 1 for t in targets], out=slot.sampled_tokens[:, 0])
             slot.sampled_event.record(self.compute_stream)
         with torch.cuda.stream(self.copy_stream):
             self.copy_stream.wait_event(slot.sampled_event)

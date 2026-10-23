@@ -7,6 +7,7 @@ import torch
 from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
 from ampere_kv.runner import (PAGED_BLOCK_SIZE,
                               model_forward, model_forward_batched, model_forward_mixed)
+from ampere_kv.sampler import RequestSampler, sample_batch
 
 WAITING, PREFILLING, RUNNING, FINISHED = "waiting", "prefilling", "running", "finished"
 
@@ -14,8 +15,8 @@ WAITING, PREFILLING, RUNNING, FINISHED = "waiting", "prefilling", "running", "fi
 class Request:
     """一个请求的输入、输出与逐层缓存；Prefill 未结束时不进入 Decode 集合。
 
-    能推导的量不再存第二份：有效历史长度读自 `caches[0].length`，下一个输入 Token 就是
-    `output_ids` 的最后一个。EOS 与达到上限都只写 `stop_reason`，不各建一套状态。
+    `caches[0].length`是已登记执行长度；同步路径从`output_ids`取下个输入，流水可领先提交。
+    采样状态在submit时绑定请求，输出位置不是KV长度；EOS与上限仍只写`stop_reason`。
     """
 
     def __init__(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int, budget_blocks: int,
@@ -104,7 +105,8 @@ class Scheduler:
         return self.decode_pipeline
 
     def submit(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int,
-               ignore_eos: bool = False, deadline: float | None = None) -> Request:
+               ignore_eos: bool = False, deadline: float | None = None, *,
+               temperature: float = 0.0, top_k: int = -1, seed: int | None = None) -> Request:
         """边界校验集中在提交时；内部模型调用不再重复检查自己产出的形状与设备。
 
         `deadline` 是同一进程 `time.monotonic()` 上的绝对时刻，None 表示不设限、走原有路径。
@@ -121,7 +123,11 @@ class Scheduler:
         # 中途耗尽块池。所以准入用预留额度判断；预算超过整层的请求在提交边界直接拒绝。
         if need > self.blocks_per_layer:
             raise ValueError(f"单请求预算 {need} 块超过每层容量 {self.blocks_per_layer} 块")
+        if self.mixed and temperature != 0:
+            raise ValueError("随机采样暂不支持mixed模式")
         request = Request(request_id, input_ids, max_new_tokens, need, ignore_eos, deadline)
+        request.sampler = RequestSampler(max_new_tokens, self.model.config.vocab_size, self.device,
+                                         temperature=temperature, top_k=top_k, seed=seed)
         self._submitted = True
         self.waiting.append(request)
         return request
@@ -158,9 +164,9 @@ class Scheduler:
         # Prefill 始终走 SDPA；Decode 用默认 V1 内核，与单请求生成路径完全相同。
         logits = model_forward(self.model, input_ids, positions, request.caches,
                                is_prefill=prefill, cuda_decode=not prefill, output_logits=output_logits)
-        # argmax 之后的 item() 是停止判断本身需要的同步，不属于"为检查而同步"。
+        # 位置按已提交输出计数：Prefill末块为0，中间块不消耗随机数。
         if output_logits:
-            self._commit(request, logits[0, 0].argmax().item())
+            self._commit(request, request.sampler.sample(logits[0, 0], len(request.output_ids)).item())
 
     def _decode_batch(self, group: list[Request], graph=None) -> None:
         """将一组请求的当前 Token 合成一次前向，各请求使用独立块表与位置。"""
@@ -176,7 +182,7 @@ class Scheduler:
         if graph is not None:
             self.graph_calls += 1
         # 一次同步取回 B 个 Token：这是各请求停止判断本身需要的，不是为检查而同步。
-        for request, token in zip(group, logits[:, 0].argmax(dim=-1).tolist()):
+        for request, token in zip(group, sample_batch(logits[:, 0], group).tolist()):
             self._commit(request, token)
 
     def _graph_for(self, group: list[Request]):
@@ -283,6 +289,7 @@ class Scheduler:
         WAITING 从未计入 `reserved_blocks`，所以扣减要看状态而不是"KV 长度是否大于 0"——
         整段 Prefill 的请求在第一次前向之前长度同样是 0，用长度判断会把它误扣一次。
         """
+        request.sampler.release()  # 流水仅在设备引用排空后退休，也在这里释放随机缓冲。
         for cache in request.caches:
             cache.release()
         request.caches.clear()  # 丢弃块表引用，请求结束后不可能再被误当成活动请求。
