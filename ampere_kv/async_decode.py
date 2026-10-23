@@ -28,16 +28,16 @@ class DecodePipeline:
 
     def __init__(self, scheduler, *, overlap):
         self.scheduler, self.overlap = scheduler, overlap
-        self.compute, self.copy = torch.cuda.Stream(), torch.cuda.Stream()
+        self.compute_stream, self.copy_stream = torch.cuda.Stream(), torch.cuda.Stream()
         self.slots = {}
         for batch, graph in scheduler.graphs.items():
             size = graph.metadata_buffer.numel() + 2 * batch
             self.slots[batch] = [SimpleNamespace(
-                host_meta=torch.empty(size, dtype=torch.long, pin_memory=True),
-                device_meta=torch.empty(size, dtype=torch.long, device=scheduler.device),
-                tokens=torch.empty(batch, 1, dtype=torch.long, device=scheduler.device),
-                output=torch.empty(batch, dtype=torch.long, pin_memory=True),
-                sampled=torch.cuda.Event(), ready=torch.cuda.Event()) for _ in range(2)]
+                metadata_host=torch.empty(size, dtype=torch.long, pin_memory=True),
+                metadata_device=torch.empty(size, dtype=torch.long, device=scheduler.device),
+                sampled_tokens=torch.empty(batch, 1, dtype=torch.long, device=scheduler.device),
+                output_host=torch.empty(batch, dtype=torch.long, pin_memory=True),
+                sampled_event=torch.cuda.Event(), ready_event=torch.cuda.Event()) for _ in range(2)]
         self.pending = self.seed = None
         self.serial = 0
         self.stats = Counter()
@@ -66,19 +66,22 @@ class DecodePipeline:
     def _launch(self, group, previous=None):
         s = self.scheduler
         self.serial += 1
+        # 两槽交替；复用前旧结果已提交且D2H完成，计算流保证旧Token先被消费。
         slot = self.slots[len(group)][self.serial % 2]
-        targets = tuple(t + 1 for t in previous.targets) if previous else tuple(len(r.output_ids) + 1 for r in group)
+        targets = (tuple(t + 1 for t in previous.targets) if previous
+                   else tuple(len(r.output_ids) + 1 for r in group))
         flight = Flight(group, targets, slot, self.serial)
         caches = [[r.caches[layer] for r in group] for layer in range(len(s.storages))]
         initial = [0] * len(group) if previous else [r.output_ids[-1] for r in group]
-        with self.trace(f"pipeline_forward:seq={flight.sequence},batch={len(group)}"), torch.cuda.stream(self.compute):
-            logits = s.graphs[len(group)].step_device(caches, previous.slot.tokens if previous else None, slot, initial)
-            torch.argmax(logits[:, 0], dim=-1, out=slot.tokens[:, 0])
-            slot.sampled.record(self.compute)
-        with torch.cuda.stream(self.copy):
-            self.copy.wait_event(slot.sampled)
-            slot.output.copy_(slot.tokens[:, 0], non_blocking=True)
-            slot.ready.record(self.copy)
+        with self.trace(f"pipeline_forward:seq={flight.sequence},batch={len(group)}"), torch.cuda.stream(self.compute_stream):
+            logits = s.graphs[len(group)].step_device(
+                caches, previous.slot.sampled_tokens if previous else None, slot, initial)
+            torch.argmax(logits[:, 0], dim=-1, out=slot.sampled_tokens[:, 0])
+            slot.sampled_event.record(self.compute_stream)
+        with torch.cuda.stream(self.copy_stream):
+            self.copy_stream.wait_event(slot.sampled_event)
+            slot.output_host.copy_(slot.sampled_tokens[:, 0], non_blocking=True)
+            slot.ready_event.record(self.copy_stream)
         s.graph_calls += 1
         self.last_batches.append((len(group), True))
         self.stats["forwards"] += 1
@@ -88,9 +91,9 @@ class DecodePipeline:
     def _post(self, flight, now):
         # 只等待previous的D2H事件，不等待计算流上已经发射的current。
         with self.trace(f"pipeline_wait:seq={flight.sequence}"):
-            flight.slot.ready.synchronize()
+            flight.slot.ready_event.synchronize()
         with self.trace(f"pipeline_post:seq={flight.sequence}"):
-            for r, target, token in zip(flight.group, flight.targets, flight.slot.output.tolist()):
+            for r, target, token in zip(flight.group, flight.targets, flight.slot.output_host.tolist()):
                 if self._stopped(r, now):
                     self.stats["discarded_tokens"] += 1
                     continue
@@ -145,7 +148,7 @@ class DecodePipeline:
             self.stats["fallback_tokens"] += sum(sizes)
             return finished + more, sizes
         # 回退/Prefill在调用流执行；只在重入时给计算流建立依赖，不全卡同步。
-        self.compute.wait_stream(torch.cuda.current_stream())
+        self.compute_stream.wait_stream(torch.cuda.current_stream())
         source = self.seed if self._same(self.seed, group) else None
         self.pending = self._launch(group, source)
         self.stats["max_inflight"] = max(self.stats["max_inflight"], 1)

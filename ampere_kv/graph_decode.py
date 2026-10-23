@@ -63,16 +63,16 @@ class CapturedDecode:
         self.metadata_buffer.copy_(host, non_blocking=False)
 
     def step_device(self, caches, source, slot, initial):
-        """流水专用：调用方持有槽至ready完成，且所有重放在同一计算流排序。"""
+        """流水专用：槽持有至ready_event完成，重放与设备Token接续在同一计算流排序。"""
         batch = len(caches[0])
         positions = [cache.length for cache in caches[0]]
         values = self.metadata_values(caches) + positions + initial
-        slot.host_meta.copy_(torch.tensor(values, dtype=torch.long))
-        slot.device_meta.copy_(slot.host_meta, non_blocking=True)
+        slot.metadata_host.copy_(torch.tensor(values, dtype=torch.long))
+        slot.metadata_device.copy_(slot.metadata_host, non_blocking=True)
         size = self.metadata_buffer.numel()
-        self.metadata_buffer.copy_(slot.device_meta[:size])
-        self.positions.copy_(slot.device_meta[size:size + batch].view(batch, 1))
-        self.tokens.copy_(source if source is not None else slot.device_meta[-batch:].view(batch, 1))
+        self.metadata_buffer.copy_(slot.metadata_device[:size])
+        self.positions.copy_(slot.metadata_device[size:size + batch].view(batch, 1))
+        self.tokens.copy_(source if source is not None else slot.metadata_device[-batch:].view(batch, 1))
         self.graph.replay()
         self.replays += 1
         return self.logits

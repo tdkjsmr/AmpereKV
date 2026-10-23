@@ -88,11 +88,13 @@ def compare(model, lengths, limits, *, force_eos=False, natural_eos=False, capac
                              natural_eos=natural_eos, capacity=capacity, prompts=prompts)
         pointers = [(x._key.data_ptr(), x._value.data_ptr()) for x in s.storages]
         slots = [slot for pair in s.decode_pipeline.slots.values() for slot in pair] if s.decode_pipeline else []
-        buffers = [(slot.tokens.data_ptr(), slot.output.data_ptr(), slot.host_meta.data_ptr()) for slot in slots]
+        buffers = [(slot.sampled_tokens.data_ptr(), slot.output_host.data_ptr(), slot.metadata_host.data_ptr())
+                   for slot in slots]
         batches = finish(s, requests)
         output = [(r.output_ids, r.stop_reason) for r in requests]
         assert pointers == [(x._key.data_ptr(), x._value.data_ptr()) for x in s.storages]
-        assert buffers == [(slot.tokens.data_ptr(), slot.output.data_ptr(), slot.host_meta.data_ptr()) for slot in slots]
+        assert buffers == [(slot.sampled_tokens.data_ptr(), slot.output_host.data_ptr(), slot.metadata_host.data_ptr())
+                           for slot in slots]
         if natural_eos:
             assert requests[0].stop_reason == "EOS", "本次未覆盖真实EOS，不计为EOS通过"
         if capacity:

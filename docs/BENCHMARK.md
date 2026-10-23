@@ -2,7 +2,7 @@
 
 本报告比较热引擎的离线整批完成时间，不比较 HTTP 服务。各组实验按被测提交分别记录，不能跨组拼接加速比。环境与 vLLM 启动配置来自对应测量进程的日志。
 
-报告中的提交哈希是测量归档的版本标识，不属于本仓库的 Git 历史。本仓库提供当前实现，不包含全部历史对照源码或原始输入；以下数据不是当前发布版本重新运行所得。
+以下历史 32 输出实验中的提交哈希是测量归档版本标识，部分不属于本仓库 Git 历史；不包含全部历史对照源码或原始输入。各节明确实测源码，后续文档整理不会使旧数字自动归属于新版本。
 
 ## 测量定义
 
@@ -95,6 +95,111 @@ G 使用 BF16/V1、块16、整段 Prefill、`mixed=False`，捕获容量 544 Tok
 单批 B=4 Nsight Systems 诊断中，旧→新 `cudaGraphLaunch` 均30次、`cudaLaunchKernel` 均18326次；`cudaMemcpyAsync` 为 `4918→628` 次，`cudaStreamSynchronize` 为 `2698→568` 次。GPU 侧 H2D 为 `2660→530` 次、总量均约 `1.287 MB`，D2D 为 `2220→60` 次、总量约 `1.151→0.002 MB`。次数差分别与30个 Graph 步每步少71次 H2D和72次 D2D的预期吻合，支持合并元数据消除了大量小拷贝；但这些是采集范围的汇总，不能仅凭汇总把每项都唯一归属到元数据。带采集开销的 B4 Graph NVTX 投影均值约 `27.635→25.267 ms`，只作机制诊断，不代替上表的正式计时或精确耗时归因。新版仍构造一份 CPU 元数据张量并做一次阻塞 H2D，未消除 Python 与同步开销。
 
 测量边界是准备好的输入提交到全部宿主输出 ID 可用的离线整批完成时间；不是 TTFT、TPOT、服务吞吐、P99 或 SLO。该组未测量 vLLM。
+
+## DI-02：受限单步流水消融（f5d5c33）
+
+这是独立的 **512 输入 / 256 输出** 实验，不改写上面的 32 输出外部基线，不拼接跨轮收益，也没有本轮 vLLM 对比。实测源码为 `f5d5c3351ae6d15bcc6ae5590f29558e7aaf8f7f`，本节后续整理不代表在整理后的提交上重测。
+
+### 配置与计时
+
+- 日期：2026-10-23；同一 RTX 3090（24 GiB），Qwen/Qwen3-8B，Revision `b968826d9c46dd6066d109eabc6255188de91218`；PyTorch `2.5.1+cu124`、CUDA `12.4`。Windows 只做源码和证据分析，实际模型及计时在 CUDA 环境执行。
+- 单卡、BF16 权重/KV、V1、块16、整段同步 Prefill、greedy、`ignore_eos=True`、`mixed=False`。B=1/B=4 每请求固定生成256个 Token，最后有效 KV 长度767；不是自然 EOS 质量评估。
+- 同进程复用模型、KV池和固定 B1/B4 Graph；容量768、块表宽48，每层池容量为 B×49 块。三路均先用8输出预热，再按 **A→B→C→C→B→A→A→B→C** 测量，每路3样本，样本间恢复空池。
+- 从现成 CUDA 输入提交开始，计入宿主驱动、输入更新、前向、取回/提交输出、最终等待与回收；不含模型加载、分词、准备输入、建池/捕获/槽初始化和预热。`total_s` 包含最后输出就绪及收尾，不能再扣除 `drain_ms`。它不是纯 Decode kernel 时间或在线服务指标。
+
+| 路径 | CLI | 含义 |
+|---|---|---|
+| A / original-sync | `--pipeline a`（默认） | 原同步 Graph 调度及宿主选词路径，仍是有效默认和回退路径 |
+| B / device-sync | `--pipeline b` | GPU argmax、设备 Token 接续，但当轮等待并提交 |
+| C / overlap | `--pipeline c` | 与 B 共用输入、采样和缓冲实现，先发射当前轮，再处理上一轮 |
+
+B 是控制变量而非另一份前向实现；C/B 用于观察改变推进时机后的差别。C/A 还包含设备接续等路径差异，不能全归因于重叠。
+
+### 原始正式样本
+
+Run ID 为 `di02-20261023-abc-b1`、`di02-20261023-abc-b4`。下表每行按实际发生顺序摘录该路径的3个样本，单位 ms；九样本全局顺序为上面的 `abccbaabc`，不是每行连续执行。原 JSON 保留精度，表格四舍五入到6位小数。
+
+| B | 路径 | 三次整批完成时间（ms） | 中位数（ms） |
+|---:|---|---|---:|
+| 1 | A | 6181.726936, 6215.981545, 6221.257931 | 6215.981545 |
+| 1 | B | 6194.782661, 6209.213601, 6233.832207 | 6209.213601 |
+| 1 | C | 6116.856288, 6130.763475, 6167.877464 | 6130.763475 |
+| 4 | A | 7163.532436, 7187.946059, 7188.770421 | 7187.946059 |
+| 4 | B | 7176.905183, 7193.594730, 7200.728668 | 7193.594730 |
+| 4 | C | 7013.971854, 7020.317450, 7035.290379 | 7020.317450 |
+
+中位数比 `100×(1−median(C)/median(B))`：B1 **1.263%**、B4 **2.409%**；相对 A 为 **1.371% / 2.332%**。另按每轮 ABC/CBA 的 B、C 配对，B−C 分别为 B1 `77.926 / 78.450 / 65.955 ms`，B4 `162.933 / 173.277 / 165.438 ms`。配对差值与中位数比是不同统计量，不能混称。三次方向一致仍只是固定负载的少量观察，不提供显著性或普遍加速保证。
+
+| 每个正式样本 | B1 | B4 |
+|---|---:|---:|
+| 全路径输出数 / Decode 前向调用数 | 256 / 255 | 1024 / 258 |
+| Graph 重放 / eager 回退 | 255 / 0 | 254 / 4（B2/B3） |
+| Graph 批量分布 / 捕获总数 | B1×255 / 1 | B1×2+B4×252 / 2 |
+| B/C 流水前向 / 设备及已提交 Token | 255 / 255 | 253 / 1009 |
+
+B4 流水之外还有5次回退 Decode、11个 Token，合计1020个 Decode Token，加4个 Prefill 首 Token 为1024。各正式样本无重新捕获，固定输出下无丢弃、无额外 GPU 前向；C 多出的宿主推进用于启动/排空，不是新增设备工作。相同 B 的 A/B/C 保存输出摘要一致，每样本最终额度为0、36层块全归还、排空后 allocated 差额为0；这不证明无限长运行无泄漏。
+
+输出滚动摘要（不是本地独立重生成或广泛精度验收）：B1 `675379756b89b785c2c304913e2e0fb5131c50617a636235d4912be2b053d181`；B4 `bd98b0668bef8292920551ddb93c4fe635e7b2155ad1e022bdf1e8efc036c3d3`。自然 EOS、受控 EOS、取消/到期、容量和退场回退、有效 KV、地址及块复用另经 `check_async_decode` 与既有回归通过。真实短提示 EOS 用例中 C 计算12个 Decode 结果、提交11个、丢弃1个；不能将固定输出的“无额外计算”扩展到 EOS 或取消场景。
+
+C 最后输出后收尾中位数 B1/B4 为 `0.406 / 0.333 ms`，已含在总时间。初始化 B1/B4 为 `511.862 / 700.688 ms`，allocated 增量 `168384512 / 489719296` 字节；包含 KV池、Graph及可选流水槽，不是流水独占开销。三路复用这些已建对象，不代表冷启动收益。
+
+### 重叠机制证据，与正式计时分开
+
+诊断 Run `di02-20261023-c-profile` 使用 Nsight Systems `2024.1.1.0`、B4/C、相同512/256工作量，只采预热后的16个推进窗口（10—25）。按宿主 `pipeline_forward:seq=j` 找到对应 Graph 发射，以 correlationId 关联 **实际 kernel/memset 活动并集**，再与 `pipeline_post:seq=j−1` 的 CPU 范围求交；排除 `pipeline_wait`，不是仅比较 NVTX 外框或 Graph 包络。
+
+| 采集内指标 | 结果 |
+|---|---|
+| 当前轮实际 Graph 活动与上一轮 CPU post 有交集 | 16/16 对；去掉前结果在窗口前产生的首对后仍为15/15 |
+| 交集时长 | 中位46.410 µs，范围36.606—56.920 µs |
+| 上一轮 CPU post 时长 | 中位47.520 µs |
+| post 完成后当前 Graph 剩余跨度 | 至少18.646 ms |
+
+例：Graph13 的设备跨度64.559504—89.377665 ms，CPU post12 为64.562892—64.615959 ms，实际设备活动交集52.491 µs。这证明本次 B4 确实跨轮重叠，等待上一轮事件没有等到当前 Graph 完成；B1 没有单独时间线。下一轮准备/提交也可与前一轮 GPU 交叠，不能将全部1.263%/2.409%收益归因于约46 µs的 CPU post。诊断整批耗时约11.128秒受采集扰动，不与正式样本相除计算收益，也不据此判定计算或访存受限。
+
+### 复现入口与输入指纹
+
+先按 README 准备兼容 CUDA 环境、固定模型缓存和扩展。固定 `v2.0.1` 不含流水入口；精确源码使用上述完整 SHA。已有干净克隆可执行：
+
+```bash
+git fetch origin codex/deepinfer-decode-handoff
+git switch --detach f5d5c3351ae6d15bcc6ae5590f29558e7aaf8f7f
+```
+
+输入文件为 UTF-8 JSON，顶层 `prompts` 数组至少4条；前4条各为512个模型兼容的非负整数 Token ID，不是文本字符串。程序在计时外读取输入并转为 CUDA 张量；B1用第一条，B4用前四条。文件字节（包括空白）参与 `input_file_sha256`，前四条规范化 ID 列表参与 `source_ids_sha256`；`templates` 和 `template_sequence_sha256` 标识实际使用的输入模板及输出上限。
+
+实测文件 SHA256：`3262a3904a3c8dfa6d85b8cd63bdc64647783a0d5cd4604496c5166b6362dd80`；前四条 ID 摘要：`22e0ff4cf8fd7422ecd69d068d732d196bd46fb9fc278e3a4ee1df40faf1291a`。实际模板序列摘要为 B1 `729771e7b2826495ec0bc8e802a4f94110eac5061e68429a5f6754952bf60e29`、B4 `8e19ee265caaacaf16c15d4532d3573ffe776cb822d76b865b22192c1b910aa0`。原输入未公开，精确复现实测数字需要原输入工件；自行准备输入只能复现流程，结果须用新 Run ID 记录。
+
+将 `INPUT_JSON` 替换为自己准备的文件；`mktemp` 创建仓库外的新结果目录，避免覆盖已有证据：
+
+```bash
+export OMP_NUM_THREADS=1
+INPUT_JSON=/absolute/path/inputs.json
+BENCH_DIR=$(mktemp -d /tmp/amperekv-di02-XXXXXX)
+python -m ampere_kv.check_async_decode
+for B in 1 4; do
+  python -m ampere_kv.bench_workload --mode steady --batch "$B" --cuda-graph \
+    --pipeline abc --output-tokens 256 --repeats 3 --input "$INPUT_JSON" \
+    --output "$BENCH_DIR/abc-b$B.json" --run-id "di02-repro-abc-b$B"
+done
+```
+
+短时间线需另行运行，不作为正式样本：
+
+```bash
+nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=stop \
+  --output="$BENCH_DIR/c-profile" \
+  python -m ampere_kv.bench_workload --mode steady --batch 4 --cuda-graph \
+    --pipeline c --output-tokens 256 --profile-rounds 10 16 --input "$INPUT_JSON" \
+    --output "$BENCH_DIR/c-profile.json" --run-id di02-repro-c-profile
+nsys export --type sqlite --output "$BENCH_DIR/c-profile.sqlite" "$BENCH_DIR/c-profile.nsys-rep"
+```
+
+结果 JSON 记录提交、配置、输入/输出摘要、前向及 Graph/丢弃计数、显存和回收；先核对这些，再比较 `total_s`。原始输入、JSON、日志与采集文件不随仓库发布；尤其 SQLite/采集报告可能包含环境变量，不直接公开。本实验仅支持固定 B1/B4、BF16/V1 greedy 纯 Decode Graph，Prefill同步，其他批量/身份/容量变化排空回退；不是任意 batch ZOS、HTTP 服务或 P99/SLO 验收。
+
+### 技术来源
+
+借鉴 [DeepInfer 固定提交774ce244](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01) 中 [`worker.execute_model_step`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/worker.py) 的 current-forward / previous-post，以及 [`prepare_tensor_input_zos.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py) 的前轮设备选词接续。来源按其 [Apache-2.0 许可证](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/LICENSE) 标识；本项目独立实现固定身份、单步前瞻子集，没有复制上述源码或引入完整 DeepInfer/TileLang/SM100 运行依赖，不包含其通用 remap、MTP 或分布式调度。
 
 ## 复现与测量边界
 

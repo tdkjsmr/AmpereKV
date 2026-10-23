@@ -27,6 +27,24 @@ Prefill 产生首个 Token 的 logits，并写入 RoPE 后的 K、未旋转的 V
 
 在首次 `submit()` 前调用 `Scheduler.enable_graphs(max_tokens)` 可启用固定 B1/B4 的 BF16/V1 Decode Graph；其他批量或超容量回退 eager，Prefill、块所有权与回收不变。Graph 不支持 INT8/V3 或混合前向。`bench_external --engine ampere --cuda-graph` 是该路径的固定负载测量入口，不是服务开关。
 
+## 可选单步流水
+
+同步 `Scheduler.step()` 保持默认。启用 Graph 后、首次提交前，可调用 `pipeline = scheduler.enable_pipeline(overlap=True)`，之后用 `pipeline.advance()` 推进，并在退出前用 `pipeline.drain()` 交付剩余结果。`overlap=False` 使用同一实现但当轮等待，是设备接续同步控制；不复制两套前向。有在途结果时禁止混用 `step()`。
+
+`async_decode.py` 的每个固定批量持有两个交替槽：设备选词、pinned 元数据与输出、采样完成和输出就绪事件。计算流串行执行输入更新、Graph 和 GPU argmax；拷贝流等待本槽采样事件后取回 Token，再记录输出就绪事件。下一轮输入直接消费前槽设备 Token，不等待其 CPU 提交。
+
+```text
+首次推进：发射 j → 返回（暂不交付 j）
+后续推进：发射 j+1 → 等 j 的输出就绪事件 → CPU 提交 j → 返回
+收尾排空：等最后一轮输出 → 提交或丢弃 → 安全退休
+```
+
+这里是 current-forward / previous-post：推进内部短暂有两轮未提交结果，接口返回时最多一轮。槽的 pinned 源及输出要保留到其就绪事件完成；计算流顺序确保设备 Token 先被下一轮消费，再轮换覆盖。`cache.length` 表示已登记执行长度，可领先 CPU 提交；对已产生首 Token 的请求，CPU 已提交的有效 KV 长度为 `输入长度 + 输出数量 - 1`。
+
+固定请求身份、容量和上限允许时才前瞻。B2/B3、等待准入、身份变化或容量边界先排空，再回退原同步调度；没有任意批次 remap。EOS 可能在下一轮已发射后才被 CPU 观察到，后续结果必须丢弃；取消/到期也不得提交已观察停止请求的在途结果。邻座合法结果照常提交，所有在途设备引用结束后才走原 `_retire()` 归还，已知生成上限则提前避免无用前瞻。Prefill 保持同步，范围不含 INT8/V3、mixed 或服务化。
+
+机制借鉴 DeepInfer 固定版本的设备 Token 接续、当前前向/前轮后处理及延迟释放，独立实现固定身份子集；不依赖 DeepInfer、TileLang 或其完整 ZOS 调度。来源和实测见[DI-02 报告](BENCHMARK.md#di-02受限单步流水消融f5d5c33)。
+
 扩展绑定见 `csrc/bindings.cpp`，实现见 `csrc/paged_decode.cu`；Python 调用点在 `runner.py` 与 `paged_cache.py`。INT8 存的是量化 K/V 及各自 scale，权重仍为 BF16。当前 CUDA 扩展按 `setup.py` 编译 `sm_86`，不能把源码中出现其他路径视为跨架构兼容性保证。
 
 检查与测量不属于执行主线：`check_model.py` 提供 CUDA/INT8 模型对照；`check_scheduler.py`、`check_chunked.py`、`check_mixed.py`、`check_graph_scheduler.py` 分别检查调度、分块与停止、混合前向、Graph。HF 逐步对照由 `runner --mode check` 开启，正常生成不执行。`bench_external.py` 提供整批计时、输出核对与可选时间线采集；`paged_decode.py` 提供独立算子数值检查及调用基准。

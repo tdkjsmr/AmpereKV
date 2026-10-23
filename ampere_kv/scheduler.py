@@ -96,7 +96,7 @@ class Scheduler:
             raise AssertionError("捕获临时块未全部归还")
 
     def enable_pipeline(self, *, overlap=True):
-        """显式实验入口；B同步控制/C单步流水均保留原step契约。"""
+        """返回显式advance/drain驱动；overlap=False为同步控制，不替换原step契约。"""
         if self._submitted or self.graphs is None or self.mixed or self.max_batch not in (1, 4) or self.decode_pipeline:
             raise ValueError("流水须在首次提交前启用，仅支持已有Graph的BF16/V1 B1/B4，不能mixed")
         from ampere_kv.async_decode import DecodePipeline
@@ -127,7 +127,7 @@ class Scheduler:
         return request
 
     def cancel(self, request: Request) -> None:
-        """标记取消；回收发生在下一次 `step()` 起点，本轮已经发出的 GPU 工作不打断。
+        """标记取消；同步路径在下轮起点回收，流水路径先排空在途引用；不打断GPU工作。
 
         只接受本调度器 `submit()` 返回的 Request——这是调用契约，不为此建全局注册表或逐轮归属
         扫描。已完成对象重复调用无作用；已有停止原因不被覆盖，所以取消优先于同一轮的到期判断。

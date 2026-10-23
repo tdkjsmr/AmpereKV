@@ -1,4 +1,4 @@
-"""闭环离线负载实验；复用生产调度，不提供服务SLO或异步收益结论。"""
+"""闭环离线负载与同步/流水消融；报告固定工作量，不代表服务SLO或普遍加速。"""
 
 import argparse
 from collections import Counter, deque
@@ -287,7 +287,8 @@ def main():
     parser.add_argument("--repeats", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--seconds", type=int, default=600)
     parser.add_argument("--cuda-graph", action="store_true")
-    parser.add_argument("--pipeline", choices=("a", "b", "c", "abc"), default="a")
+    parser.add_argument("--pipeline", choices=("a", "b", "c", "abc"), default="a",
+                        help="a=original-sync（默认），b=device-sync，c=overlap；abc=三路交错对照")
     parser.add_argument("--profile-rounds", nargs=2, type=int, metavar=("START", "COUNT"))
     args = parser.parse_args()
     if args.pipeline != "a" and (not args.cuda_graph or args.batch not in (1, 4)):
