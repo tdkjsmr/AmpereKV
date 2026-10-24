@@ -312,7 +312,8 @@ def final_logits(model, hidden_states):
 def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS,
                     verify: bool = False, cache_kind: str = "contiguous", cuda_decode: bool = False,
                     kv_dtype: torch.dtype = torch.bfloat16, ignore_eos: bool = False, v3: bool = False,
-                    temperature: float = 0.0, top_k: int = -1, seed: int | None = None) -> list[int]:
+                    temperature: float = 0.0, top_k: int = -1, seed: int | None = None,
+                    sampling_backend: str = "reference") -> list[int]:
     """返回新 Token IDs；每次请求创建独立缓存，不向调用方保留 GPU 张量。
 
     verify 额外执行 HF 参考与诊断；模式组合在 CLI 边界检查。
@@ -322,7 +323,7 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS,
     if temperature != 0 and (verify or kv_dtype != torch.bfloat16 or v3):
         raise ValueError("随机生成仅覆盖BF16/V1非对照路径")
     sampler = RequestSampler(max_new_tokens, model.config.vocab_size, input_ids.device,
-                             temperature=temperature, top_k=top_k, seed=seed)
+                             temperature=temperature, top_k=top_k, seed=seed, sampling_backend=sampling_backend)
     if temperature > 0:
         print(f"[采样] temperature={temperature}，top_k={top_k}，seed={sampler.seed}")
     tokens = input_ids.shape[1]
@@ -410,8 +411,9 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0, help="0保留greedy；正数启用请求级采样")
     parser.add_argument("--top-k", type=int, default=-1, help="-1为全词表，或1..vocab_size")
     parser.add_argument("--seed", type=int, default=None, help="请求种子0..2^32-1；随机模式省略则选择并打印种子")
+    parser.add_argument("--sampling-backend", choices=("reference", "cuda"), default="reference")
     args = parser.parse_args()
-    if (args.temperature != 0 or args.top_k != -1 or args.seed is not None) and (
+    if (args.temperature != 0 or args.top_k != -1 or args.seed is not None or args.sampling_backend != "reference") and (
             args.mode != "generate" or args.kv_dtype != "bf16" or args.decode_kernel != "v1"):
         parser.error("采样参数仅用于generate的BF16/V1路径")
     if args.mode in ("cuda-check", "int8-check") and args.cache != "paged":
@@ -450,7 +452,7 @@ def main() -> None:
         model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache,
         cuda_decode=use_int8, kv_dtype=torch.int8 if use_int8 else torch.bfloat16,
         v3=args.decode_kernel == "v3",
-        temperature=args.temperature, top_k=args.top_k, seed=args.seed,
+        temperature=args.temperature, top_k=args.top_k, seed=args.seed, sampling_backend=args.sampling_backend,
     )
     eos_ids = model.generation_config.eos_token_id
     eos_ids = [eos_ids] if isinstance(eos_ids, int) else (eos_ids or [])

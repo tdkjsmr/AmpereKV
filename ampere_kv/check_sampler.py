@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import torch
 
-from ampere_kv.sampler import RequestSampler, distribution, sample_batch, sample_uniform
+from ampere_kv.sampler import (RequestSampler, distribution, sample_batch, sample_uniform,
+                               cuda_topk, cuda_candidates)
 
 
 def reference(logits, temperature, top_k, uniform):
@@ -102,29 +103,130 @@ def check_positions(device):
     print("[PASS] 请求私有uniform/全局RNG不变、seed复现、行重排/插入退出、位置0/1与前瞻丢弃重取")
 
 
-def check_model():
+def check_cuda():
+    from transformers import AutoConfig
+    from ampere_kv.runner import MODEL_ID, MODEL_REVISION
+    vocab = AutoConfig.from_pretrained(MODEL_ID, revision=MODEL_REVISION, local_files_only=True).vocab_size
+    generator = torch.Generator(device="cuda").manual_seed(99)
+    for batch in (1, 4):
+        for k in (40, 128):
+            for dtype in (torch.float32, torch.bfloat16):
+                for size in (vocab, vocab + 13):
+                    x = torch.randn(batch, size, device="cuda", generator=generator).to(dtype)
+                    if size != vocab:
+                        x[:, -13:] = 8  # 强制非整段尾部进入Top-K。
+                    for kind in ("random", "ties", "zero", "negative", "extreme"):
+                        if kind == "ties":
+                            x.fill_(-2); x[:, ::17] = 1  # 第K名同分跨多个分段。
+                        elif kind == "zero":
+                            x.zero_(); x[:, ::2] = -0.0
+                        elif kind == "negative":
+                            x = -torch.arange(size, device="cuda", dtype=torch.float32)[None].expand(batch, -1).contiguous().to(dtype)
+                        elif kind == "extreme":
+                            x.fill_(-3e38); x[:, ::4096] = 3e38
+                        values, ids = cuda_topk(x, k)
+                        scores, ordered = torch.sort(x.float(), descending=True, stable=True)
+                        assert torch.equal(ids, ordered[:, :k]), (batch, k, dtype, size, kind)
+                        torch.testing.assert_close(values, scores[:, :k], rtol=0, atol=0)
+                        temperatures = torch.linspace(0.6, 1.2, batch, device="cuda")
+                        expected = [distribution(row, t.item(), -1)[1] for row, t in zip(values, temperatures)]
+                        cdfs = [p.cumsum(-1).clamp_max_(1) for p in expected]
+                        for c in cdfs:
+                            c[-1] = 1
+                        reference_cdf = torch.stack(cdfs)
+                        edge = reference_cdf[:, k // 2]
+                        uniforms = [torch.zeros_like(edge), torch.full_like(edge, 1 - 2**-24),
+                                    torch.nextafter(edge, torch.zeros_like(edge)), edge,
+                                    torch.nextafter(edge, torch.ones_like(edge))]
+                        out = torch.empty(batch, device="cuda", dtype=torch.long)
+                        for u in uniforms:
+                            probs, cdf = cuda_candidates(values, ids, temperatures, u, out)
+                            for row in range(batch):
+                                _, independent, _ = reference(values[row], temperatures[row].item(), -1, u[row].item())
+                                torch.testing.assert_close(probs[row].cpu(), torch.tensor(independent), rtol=2e-6, atol=1e-7)
+                            choices = torch.searchsorted(reference_cdf.contiguous(), u[:, None], right=True).clamp_max(k - 1)
+                            tokens = ids.gather(1, choices).flatten()
+                            if not torch.equal(out, tokens):
+                                print(f"[分歧] B={batch} K={k} V={size} dtype={dtype} case={kind} uniform={u.tolist()}")
+                                print(f"[分歧] 候选={ids.tolist()} CDF差={(cdf-reference_cdf).tolist()} "
+                                      f"reference={tokens.tolist()} cuda={out.tolist()}")
+                                raise AssertionError("候选一致但CDF边界选词不同")
+                        assert torch.equal(cuda_topk(x, k)[1], ids)
+    for bad in (torch.zeros(1, 127, device="cuda"), torch.zeros(1, 256, device="cuda", dtype=torch.float16)):
+        try:
+            cuda_topk(bad, 128)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("扩展未拒绝非法词表长度或dtype")
+    for k in (40, 128):
+        states = [RequestSampler(8, vocab, "cuda", temperature=0.8, top_k=k, seed=i,
+                                 sampling_backend="cuda") for i in range(4)]
+        requests = [SimpleNamespace(sampler=s, output_ids=[]) for s in states]
+        x = torch.zeros(4, vocab, device="cuda")
+        tokens = sample_batch(x, requests, [0, 1, 2, 3])
+        order = [3, 1, 0, 2]
+        assert torch.equal(sample_batch(x[order], [requests[i] for i in order], [3, 1, 0, 2]), tokens[order])
+        assert sample_batch(x[:1], requests[:1], [0])[0].item() == tokens[0].item()
+        assert torch.equal(sample_batch(x, requests, [0, 1, 2, 3]), tokens)
+        states[0].temperature = 0
+        assert torch.equal(sample_batch(x, requests), torch.stack([r.sampler.sample(row, 0, sampling_backend="reference")
+                                                                  for row, r in zip(x, requests)]))
+    print("[PASS] CUDA候选、概率/CDF边界、尾部/同分与请求位置检查通过")
+
+
+def check_model(sampling_backend="reference"):
     from ampere_kv.check_async_decode import CheckedScheduler, create, finish, check_stop_and_reuse
     from ampere_kv.runner import load_model_and_tokenizer
 
     class RecordingScheduler(CheckedScheduler):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args, backend="reference", top_k=None, **kwargs):
             super().__init__(*args, **kwargs)
             self.draws = {}
             self.parameters = {}
+            self.cache_requests = {}
+            self.backend, self.top_k = backend, top_k
+
+        def enable_graphs(self, max_tokens):
+            super().enable_graphs(max_tokens)
+            for graph in self.graphs.values():
+                for name in ("step", "step_device"):
+                    original = getattr(graph, name)
+
+                    def recorded_graph(caches, *args, original=original):
+                        logits = original(caches, *args)
+                        for row, cache in enumerate(caches[0]):
+                            r = self.cache_requests[id(cache)]
+                            self.remember(r, logits[row, 0], cache.length - r.input_ids.shape[1])
+                        return logits
+
+                    setattr(graph, name, recorded_graph)
+
+        def _admit(self):
+            super()._admit()
+            if self.prefilling is not None:
+                self.cache_requests[id(self.prefilling.caches[0])] = self.prefilling
+
+        def remember(self, request, logits, position):
+            state = request.sampler
+            self.draws[request.request_id][position] = (logits.detach().clone(),
+                state.uniforms[position].clone() if state.uniforms is not None else None, None)
 
         def submit(self, request_id, *args, **kwargs):
             # 固定用例按完整ID选参数；replacement不是编号请求。
             index = {"r0": 0, "r1": 1, "r2": 2, "r3": 3}.get(request_id, 4)
-            temperature, k = ((0.7, 7), (1.2, 23), (0.0, -1), (0.9, -1), (1.0, 11))[index]
+            temperature, k = (((0.8, self.top_k),) * 5 if self.top_k is not None else
+                              ((0.7, 7), (1.2, 23), (0.0, -1), (0.9, -1), (1.0, 11)))[index]
             if self.force_eos and index == 0:
                 k = 1  # 受控生命周期沿用greedy历史，避免随机EOS早于注入点。
-            request = super().submit(request_id, *args, **kwargs, temperature=temperature, top_k=k, seed=101 + index)
+            request = super().submit(request_id, *args, **kwargs, temperature=temperature, top_k=k, seed=101 + index,
+                                     sampling_backend=self.backend)
             self.parameters[request_id] = temperature, k
             state, draws = request.sampler, self.draws.setdefault(request_id, {})
             sample = state.sample
 
-            def recorded(logits, position):
-                token = sample(logits, position)
+            def recorded(logits, position, **kwargs):
+                token = sample(logits, position, **kwargs)
                 draws[position] = (logits.detach().clone(),
                                    state.uniforms[position].clone() if state.uniforms is not None else None,
                                    token.clone())
@@ -143,17 +245,23 @@ def check_model():
         print(f"[分歧] logits最大差={(before[0].float() - after[0].float()).abs().max().item()}")
         for label, (logits, uniform, token) in zip(("A", mode), (before, after)):
             ids, probs = distribution(logits, temperature or 1.0, k)
-            print(f"[分歧] {label} uniform={None if uniform is None else uniform.item()} Token={token.item()} "
+            print(f"[分歧] {label} uniform={None if uniform is None else uniform.item()} Token={None if token is None else token.item()} "
                   f"前8候选={ids[:8].tolist()} 概率={probs[:8].tolist()}")
 
     model, _ = load_model_and_tokenizer()
-    cases = [((15,), (8,), None, False), ((15, 16, 63, 64), (5, 8, 6, 9), None, False),
-             ((15,), (8,), 16, False), ((15, 16, 63, 64), (8, 8, 8, 8), None, True)]
-    for lengths, limits, capacity, force_eos in cases:
+    cases = [((15,), (8,), None, False, 40), ((15, 16, 63, 64), (5, 8, 6, 9), None, False, 128),
+             ((15,), (8,), 16, False, 128), ((15, 16, 63, 64), (8, 8, 8, 8), None, True, 40)]
+    if sampling_backend == "cuda":
+        cases.append(((15, 16, 63, 64), (4, 4, 4, 4), None, False, 40))
+    for lengths, limits, capacity, force_eos, top_k in cases:
         baseline = None
-        for mode in "abc":
+        variants = [(backend, mode) for backend in (("reference", "cuda") if sampling_backend == "cuda" else ("reference",))
+                    for mode in "abc"]
+        for backend, mode in variants:
+            def make_scheduler(*args, **kwargs):
+                return RecordingScheduler(*args, backend=backend, top_k=top_k if sampling_backend == "cuda" else None, **kwargs)
             s, requests = create(model, mode, lengths, limits, capacity=capacity, force_eos=force_eos,
-                                 scheduler_type=RecordingScheduler)
+                                 scheduler_type=make_scheduler)
             if mode == "c":
                 s.decode_pipeline.advance()
                 s.decode_pipeline.drain()
@@ -166,7 +274,8 @@ def check_model():
                     if actual != expected:
                         position = next((j for j, (a, b) in enumerate(zip(actual[0], expected[0])) if a != b),
                                         min(len(actual[0]), len(expected[0])))
-                        diagnose(baseline[0], s, f"r{i}", position, mode)
+                        print(f"[分歧] 输出reference={expected[0]} {backend}/{mode}={actual[0]}")
+                        diagnose(baseline[0], s, f"r{i}", position, f"{backend}/{mode}")
                         raise AssertionError("同成员同历史随机对照分歧")
                 if not force_eos:
                     for rid, layers in s.saved.items():
@@ -185,19 +294,23 @@ def check_model():
                 assert requests[0].stop_reason == "EOS" and len(requests[0].output_ids) == 3
                 if mode == "c":
                     assert s.decode_pipeline.stats["discarded_tokens"] >= 1
-            print(f"[PASS] 采样路径={mode} 历史={lengths}：位置0/Decode、输出/停止/KV及释放；批量={sorted(batches)}")
-    check_stop_and_reuse(model, scheduler_type=RecordingScheduler)
+            k_label = top_k if sampling_backend == "cuda" else "逐请求"
+            print(f"[PASS] 采样后端={backend} 路径={mode} K={k_label} 历史={lengths}：输出/停止/KV及释放；批量={sorted(batches)}")
+    check_stop_and_reuse(model, scheduler_type=make_scheduler)
     print("[完成] 请求级采样与模型集成检查通过")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", action="store_true", help="纯采样通过后另跑短模型与生命周期")
+    parser.add_argument("--sampling-backend", choices=("reference", "cuda"), default="reference")
     args = parser.parse_args()
     check_probabilities("cuda")
     check_positions("cuda")
+    if args.sampling_backend == "cuda":
+        check_cuda()
     if args.model:
-        check_model()
+        check_model(args.sampling_backend)
 
 
 if __name__ == "__main__":

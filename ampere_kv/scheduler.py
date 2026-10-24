@@ -106,7 +106,8 @@ class Scheduler:
 
     def submit(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int,
                ignore_eos: bool = False, deadline: float | None = None, *,
-               temperature: float = 0.0, top_k: int = -1, seed: int | None = None) -> Request:
+               temperature: float = 0.0, top_k: int = -1, seed: int | None = None,
+               sampling_backend: str = "reference") -> Request:
         """边界校验集中在提交时；内部模型调用不再重复检查自己产出的形状与设备。
 
         `deadline` 是同一进程 `time.monotonic()` 上的绝对时刻，None 表示不设限、走原有路径。
@@ -127,7 +128,8 @@ class Scheduler:
             raise ValueError("随机采样暂不支持mixed模式")
         request = Request(request_id, input_ids, max_new_tokens, need, ignore_eos, deadline)
         request.sampler = RequestSampler(max_new_tokens, self.model.config.vocab_size, self.device,
-                                         temperature=temperature, top_k=top_k, seed=seed)
+                                         temperature=temperature, top_k=top_k, seed=seed,
+                                         sampling_backend=sampling_backend)
         self._submitted = True
         self.waiting.append(request)
         return request

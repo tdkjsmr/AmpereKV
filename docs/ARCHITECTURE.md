@@ -71,6 +71,10 @@ GPU 选词在模型 Graph 外进行：有限 BF16/FP32 logits 转 FP32，按分�
 
 固定环境下，相同 logits、参数、seed 和位置可复现采样。设计参考 DeepInfer 的[请求参数](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/sampling_params.py)与[采样层](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py)；本项目独立实现请求随机流与逆 CDF 选词。
 
+`sampling_backend="reference"` 保留稳定排序参考；显式 `cuda` 对同 K 的 B1/B4、K40/128 使用 `csrc/sampling.cu`。每2048个分数由256线程处理：线程内排序8个键，全块反复取最大值保留K项，再按各段有序队首归并。键组合FP32有序位与反向ID，同分取小ID，正负零统一，越界尾项不参与候选。随后一个warp融合温度、softmax、CDF与选词；概率为FP32，前缀用double累积再写回FP32。其余情况回参考，全greedy仍用批量argmax。
+
+CUDA后端复用请求uniform及逻辑位置，缓存设备温度；组批和临时分配在模型Graph外、当前CUDA流执行，结果写回原设备槽。算法划分参考 DeepInfer [`process_sampling`](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler_utils.py) 的候选缩减/融合阶段及 [DeepSelect](https://github.com/deepseek-ai/DeepSelect/tree/bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18) 的大词表小K场景；实现独立编写，不依赖它们的运行库。候选ID需精确对齐；概率沿用现有容差，CDF边界选词差异由检查入口输出定位。
+
 ## 检查与测量
 
 `check_model.py` 提供 CUDA/INT8 模型对照，`runner --mode check` 开启 HF 逐步对照。调度、分块、混合前向、Graph、流水和采样各有对应的 `check_*` 入口。

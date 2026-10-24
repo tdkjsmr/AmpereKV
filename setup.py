@@ -12,7 +12,7 @@ setup(
         CUDAExtension(
             name="ampere_kv._C",
             # setuptools 要求源码使用相对于 setup.py 的正斜杠路径。
-            sources=["csrc/bindings.cpp", "csrc/smoke_cuda.cu", "csrc/paged_decode.cu"],
+            sources=["csrc/bindings.cpp", "csrc/smoke_cuda.cu", "csrc/paged_decode.cu", "csrc/sampling.cu"],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": [

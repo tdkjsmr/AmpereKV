@@ -2,6 +2,9 @@
 
 // CUDA 实现在 smoke_cuda.cu 中，这里只声明 Python 需要调用的函数。
 at::Tensor smoke_add_cuda(const at::Tensor& left, const at::Tensor& right);
+std::vector<at::Tensor> sampling_topk_cuda(const at::Tensor& logits, int64_t k);
+std::vector<at::Tensor> sampling_candidates_cuda(const at::Tensor& values, const at::Tensor& ids,
+    const at::Tensor& temperatures, const at::Tensor& uniforms, const at::Tensor& output);
 // 只读已写好的物理 K/V 与块表；长度包含当前 Token，不负责追加或分配。
 // v3=true 时一个线程块服务同一 GQA 组的四个 Query 头，默认 false 使用 V1。
 at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
@@ -41,6 +44,8 @@ at::Tensor paged_decode_batched_cuda(const at::Tensor& query, const at::Tensor& 
                                      const at::Tensor& table, const at::Tensor& starts);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("sampling_topk", &sampling_topk_cuda, "分段精确Top-K：分数降序、同分ID升序");
+  module.def("sampling_candidates", &sampling_candidates_cuda, "小候选集温度/概率/CDF/选词融合");
   module.def("quantize_write", &quantize_write_cuda, "Prefill/Decode INT8量化与分页写入融合");
   module.def("bf16_write", &bf16_write_cuda, "Prefill/Decode BF16分页写入融合");
   // 批量路径：一次写入 B 个请求的当前 Token，一次注意力读取 B 个请求各自的块表。
