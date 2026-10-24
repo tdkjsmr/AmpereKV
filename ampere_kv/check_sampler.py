@@ -2,6 +2,7 @@
 
 import argparse
 import math
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -103,11 +104,122 @@ def check_positions(device):
     print("[PASS] 请求私有uniform/全局RNG不变、seed复现、行重排/插入退出、位置0/1与前瞻丢弃重取")
 
 
+def boundary_intervals(left, right, uniform, a, b):
+    intervals = [(i, min(left[i], right[i]), max(left[i], right[i])) for i in range(min(a, b), max(a, b))]
+    assert all(lo <= uniform < hi for _, lo, hi in intervals), (uniform, a, b, intervals)
+    return intervals
+
+
+def check_candidates(values, ids, temperatures, uniforms):
+    """仅供检查：独立FP64概率、累计概率与各自区间选词。"""
+    k = values.shape[1]
+    out = torch.empty(values.shape[0], device=values.device, dtype=torch.long)
+    probs, cdf = cuda_candidates(values, ids, temperatures, uniforms, out)
+    reference_tokens, stats = [], dict(samples=0, boundary=0, max_cdf_abs=0.0, intervals=[])
+    for row, (scores, t, u) in enumerate(zip(values, temperatures.tolist(), uniforms.tolist())):
+        _, independent, _ = reference(scores, t, -1, u)
+        _, ref_probs = distribution(scores, t, -1)
+        ref_cdf = ref_probs.cumsum(0).clamp_max_(1); ref_cdf[-1] = 1
+        p, q = ref_probs.tolist(), probs[row].tolist()
+        left, right = ref_cdf.tolist(), cdf[row].tolist()
+        truth = [min(1.0, math.fsum(independent[:i + 1])) for i in range(k)]; truth[-1] = 1.0
+        accumulated = [min(1.0, math.fsum(q[:i + 1])) for i in range(k)]; accumulated[-1] = 1.0
+        for actual in (p, q):
+            torch.testing.assert_close(torch.tensor(actual), torch.tensor(independent), rtol=2e-6, atol=1e-7)
+        for actual in (left, right):
+            assert all(math.isfinite(x) and 0 <= x <= 1 for x in actual) and actual[-1] == 1
+            assert all(a <= b for a, b in zip(actual, actual[1:]))
+        error = max(abs(a - b) for x, y in ((left, truth), (right, truth), (left, right), (right, accumulated))
+                    for a, b in zip(x, y))
+        assert error <= 1e-6, ("CDF绝对误差", error)
+        a = next((i for i, x in enumerate(left) if x > u), k - 1)
+        b = next((i for i, x in enumerate(right) if x > u), k - 1)
+        ref_token = sample_uniform(scores, t, -1, uniforms[row])
+        assert ref_token.item() == a and out[row].item() == ids[row, b].item(), ("选词不符合自身CDF", row, u, a, b)
+        reference_tokens.append(ids[row, a])
+        if a != b:
+            stats["intervals"].append((row, u, boundary_intervals(left, right, u, a, b)))
+            stats["boundary"] += 1
+        stats["samples"] += 1
+        stats["max_cdf_abs"] = max(stats["max_cdf_abs"], error)
+    return torch.stack(reference_tokens), out, stats
+
+
+def check_sampling(logits, temperatures, uniforms, k):
+    values, ids = cuda_topk(logits, k)
+    scores, ordered = torch.sort(logits.float(), descending=True, stable=True)
+    assert torch.equal(ids, ordered[:, :k]), "候选ID/顺序不同"
+    torch.testing.assert_close(values, scores[:, :k], rtol=0, atol=0)
+    return check_candidates(values, ids, temperatures, uniforms)
+
+
+@contextmanager
+def capture_sampling():
+    """诊断运行临时捕获同一份采样输入；退出后恢复，不用于正式计时。"""
+    from ampere_kv import scheduler, async_decode
+    single, batch = RequestSampler.sample, sample_batch
+    trace = dict(draws={}, outputs={})
+    def remember(state, logits, position, token, backend):
+        trace["draws"][state.seed, position] = (logits.clone(), state.uniforms[position].clone()
+            if state.uniforms is not None else None, state.temperature, state.top_k, backend, token.clone())
+    def sampled(state, logits, position, **kwargs):
+        token = single(state, logits, position, **kwargs)
+        backend = kwargs.get("sampling_backend") or state.backend
+        if logits.numel() > 524288:
+            backend = "reference"
+        remember(state, logits, position, token, backend if state.top_k in (40, 128) and state.temperature > 0 else "reference")
+        return token
+    def batched(logits, requests, positions=None, out=None):
+        tokens = batch(logits, requests, positions, out)
+        states = [r.sampler for r in requests]
+        fast = len(states) in (1, 4) and logits.shape[1] <= 524288 and states[0].top_k in (40, 128) and all(
+            s.backend == "cuda" and s.top_k == states[0].top_k and s.temperature > 0 for s in states)
+        for i, (r, p) in enumerate(zip(requests, positions if positions is not None else [len(r.output_ids) for r in requests])):
+            remember(r.sampler, logits[i], p, tokens[i], "cuda" if fast else "reference")
+        return tokens
+    retire = scheduler.Scheduler._retire
+    def retired(s, r):
+        trace["outputs"][r.sampler.seed] = list(r.output_ids)
+        return retire(s, r)
+    RequestSampler.sample, scheduler.sample_batch, async_decode.sample_batch = sampled, batched, batched
+    scheduler.Scheduler._retire = retired
+    try:
+        yield trace
+    finally:
+        RequestSampler.sample, scheduler.sample_batch, async_decode.sample_batch = single, batch, batch
+        scheduler.Scheduler._retire = retire
+
+
+def compare_traces(before, after):
+    """每请求只检查首次分叉；后续不同历史不再作采样误差比较。"""
+    boundaries = []
+    for seed, expected in before["outputs"].items():
+        actual = after["outputs"][seed]
+        if expected == actual:
+            continue
+        position = next((i for i, (a, b) in enumerate(zip(expected, actual)) if a != b), min(len(expected), len(actual)))
+        assert position < min(len(expected), len(actual)), "相同前缀却提前停止"
+        x, u, t, k, backend, token = before["draws"][seed, position]
+        y, v, other_t, other_k, other_backend, other_token = after["draws"][seed, position]
+        assert u is not None and v is not None, "greedy首次选词不同"
+        assert torch.equal(x, y) and torch.equal(u, v) and (t, k) == (other_t, other_k), "首次分歧输入不同，需定位模型路径"
+        assert backend != other_backend, "相同采样后端首次选词不同"
+        ref, cuda, stats = check_sampling(x[None], x.new_tensor([t], dtype=torch.float32), u[None], k)
+        choices = {"reference": ref.item(), "cuda": cuda.item()}
+        assert token.item() == expected[position] == choices[backend]
+        assert other_token.item() == actual[position] == choices[other_backend] and stats["boundary"] == 1
+        record = dict(seed=seed, position=position, backends=[backend, other_backend], intervals=stats["intervals"])
+        boundaries.append(record)
+        print(f"[边界] 首次分叉={record}；该请求后续历史不再对比")
+    return boundaries
+
+
 def check_cuda():
     from transformers import AutoConfig
     from ampere_kv.runner import MODEL_ID, MODEL_REVISION
     vocab = AutoConfig.from_pretrained(MODEL_ID, revision=MODEL_REVISION, local_files_only=True).vocab_size
     generator = torch.Generator(device="cuda").manual_seed(99)
+    summary = {name: dict(samples=0, boundary=0, max_cdf_abs=0.0) for name in ("random", "boundary")}
     for batch in (1, 4):
         for k in (40, 128):
             for dtype in (torch.float32, torch.bfloat16):
@@ -139,18 +251,21 @@ def check_cuda():
                                     torch.nextafter(edge, torch.zeros_like(edge)), edge,
                                     torch.nextafter(edge, torch.ones_like(edge))]
                         out = torch.empty(batch, device="cuda", dtype=torch.long)
-                        for u in uniforms:
-                            probs, cdf = cuda_candidates(values, ids, temperatures, u, out)
-                            for row in range(batch):
-                                _, independent, _ = reference(values[row], temperatures[row].item(), -1, u[row].item())
-                                torch.testing.assert_close(probs[row].cpu(), torch.tensor(independent), rtol=2e-6, atol=1e-7)
-                            choices = torch.searchsorted(reference_cdf.contiguous(), u[:, None], right=True).clamp_max(k - 1)
-                            tokens = ids.gather(1, choices).flatten()
-                            if not torch.equal(out, tokens):
-                                print(f"[分歧] B={batch} K={k} V={size} dtype={dtype} case={kind} uniform={u.tolist()}")
-                                print(f"[分歧] 候选={ids.tolist()} CDF差={(cdf-reference_cdf).tolist()} "
-                                      f"reference={tokens.tolist()} cuda={out.tolist()}")
-                                raise AssertionError("候选一致但CDF边界选词不同")
+                        _, other = cuda_candidates(values, ids, temperatures, uniforms[0], out)
+                        other_edge = other[:, k // 2]
+                        uniforms += [other_edge, torch.nextafter(other_edge, torch.zeros_like(edge)),
+                                     torch.nextafter(other_edge, torch.ones_like(edge)), (edge + other_edge) * 0.5]
+                        for name, u in [("boundary", u) for u in uniforms] + [
+                                ("random", torch.rand(batch, device="cuda", generator=generator)) for _ in range(4)]:
+                            try:
+                                _, tokens, stats = check_candidates(values, ids, temperatures, u)
+                            except AssertionError as error:
+                                raise AssertionError((batch, k, dtype, size, kind, name, u.tolist())) from error
+                            _, repeated, _ = check_candidates(values, ids, temperatures, u)
+                            assert torch.equal(tokens, repeated), "同后端重复选词不同"
+                            for key in ("samples", "boundary"):
+                                summary[name][key] += stats[key]
+                            summary[name]["max_cdf_abs"] = max(summary[name]["max_cdf_abs"], stats["max_cdf_abs"])
                         assert torch.equal(cuda_topk(x, k)[1], ids)
     for bad in (torch.zeros(1, 127, device="cuda"), torch.zeros(1, 256, device="cuda", dtype=torch.float16)):
         try:
@@ -173,6 +288,7 @@ def check_cuda():
         assert torch.equal(sample_batch(x, requests), torch.stack([r.sampler.sample(row, 0, sampling_backend="reference")
                                                                   for row, r in zip(x, requests)]))
     print("[PASS] CUDA候选、概率/CDF边界、尾部/同分与请求位置检查通过")
+    print(f"[汇总] 普通随机数与主动边界样本分开统计：{summary}")
 
 
 def check_model(sampling_backend="reference"):
@@ -182,35 +298,7 @@ def check_model(sampling_backend="reference"):
     class RecordingScheduler(CheckedScheduler):
         def __init__(self, *args, backend="reference", top_k=None, **kwargs):
             super().__init__(*args, **kwargs)
-            self.draws = {}
-            self.parameters = {}
-            self.cache_requests = {}
             self.backend, self.top_k = backend, top_k
-
-        def enable_graphs(self, max_tokens):
-            super().enable_graphs(max_tokens)
-            for graph in self.graphs.values():
-                for name in ("step", "step_device"):
-                    original = getattr(graph, name)
-
-                    def recorded_graph(caches, *args, original=original):
-                        logits = original(caches, *args)
-                        for row, cache in enumerate(caches[0]):
-                            r = self.cache_requests[id(cache)]
-                            self.remember(r, logits[row, 0], cache.length - r.input_ids.shape[1])
-                        return logits
-
-                    setattr(graph, name, recorded_graph)
-
-        def _admit(self):
-            super()._admit()
-            if self.prefilling is not None:
-                self.cache_requests[id(self.prefilling.caches[0])] = self.prefilling
-
-        def remember(self, request, logits, position):
-            state = request.sampler
-            self.draws[request.request_id][position] = (logits.detach().clone(),
-                state.uniforms[position].clone() if state.uniforms is not None else None, None)
 
         def submit(self, request_id, *args, **kwargs):
             # 固定用例按完整ID选参数；replacement不是编号请求。
@@ -219,34 +307,8 @@ def check_model(sampling_backend="reference"):
                               ((0.7, 7), (1.2, 23), (0.0, -1), (0.9, -1), (1.0, 11)))[index]
             if self.force_eos and index == 0:
                 k = 1  # 受控生命周期沿用greedy历史，避免随机EOS早于注入点。
-            request = super().submit(request_id, *args, **kwargs, temperature=temperature, top_k=k, seed=101 + index,
-                                     sampling_backend=self.backend)
-            self.parameters[request_id] = temperature, k
-            state, draws = request.sampler, self.draws.setdefault(request_id, {})
-            sample = state.sample
-
-            def recorded(logits, position, **kwargs):
-                token = sample(logits, position, **kwargs)
-                draws[position] = (logits.detach().clone(),
-                                   state.uniforms[position].clone() if state.uniforms is not None else None,
-                                   token.clone())
-                return token
-
-            state.sample = recorded
-            return request
-
-    def diagnose(baseline, current, rid, position, mode):
-        before, after = baseline.draws[rid].get(position), current.draws[rid].get(position)
-        print(f"[分歧] 路径={mode} 请求={rid} 逻辑输出位置={position}（首Token=0）")
-        if before is None or after is None:
-            print("[分歧] 该位置未执行采样或走整组greedy快路径，没有随机采样记录")
-            return
-        temperature, k = current.parameters[rid]
-        print(f"[分歧] logits最大差={(before[0].float() - after[0].float()).abs().max().item()}")
-        for label, (logits, uniform, token) in zip(("A", mode), (before, after)):
-            ids, probs = distribution(logits, temperature or 1.0, k)
-            print(f"[分歧] {label} uniform={None if uniform is None else uniform.item()} Token={None if token is None else token.item()} "
-                  f"前8候选={ids[:8].tolist()} 概率={probs[:8].tolist()}")
+            return super().submit(request_id, *args, **kwargs, temperature=temperature, top_k=k, seed=101 + index,
+                                  sampling_backend=self.backend)
 
     model, _ = load_model_and_tokenizer()
     cases = [((15,), (8,), None, False, 40), ((15, 16, 63, 64), (5, 8, 6, 9), None, False, 128),
@@ -254,38 +316,37 @@ def check_model(sampling_backend="reference"):
     if sampling_backend == "cuda":
         cases.append(((15, 16, 63, 64), (4, 4, 4, 4), None, False, 40))
     for lengths, limits, capacity, force_eos, top_k in cases:
-        baseline = None
+        baselines = {}
         variants = [(backend, mode) for backend in (("reference", "cuda") if sampling_backend == "cuda" else ("reference",))
                     for mode in "abc"]
         for backend, mode in variants:
             def make_scheduler(*args, **kwargs):
                 return RecordingScheduler(*args, backend=backend, top_k=top_k if sampling_backend == "cuda" else None, **kwargs)
-            s, requests = create(model, mode, lengths, limits, capacity=capacity, force_eos=force_eos,
-                                 scheduler_type=make_scheduler)
-            if mode == "c":
-                s.decode_pipeline.advance()
-                s.decode_pipeline.drain()
-            batches = finish(s, requests)
+            with capture_sampling() as trace:
+                s, requests = create(model, mode, lengths, limits, capacity=capacity, force_eos=force_eos,
+                                     scheduler_type=make_scheduler)
+                if mode == "c":
+                    s.decode_pipeline.advance()
+                    s.decode_pipeline.drain()
+                batches = finish(s, requests)
             output = [(r.output_ids, r.stop_reason) for r in requests]
-            if baseline is None:
-                baseline = s, output
-            else:
-                for i, (actual, expected) in enumerate(zip(output, baseline[1])):
-                    if actual != expected:
-                        position = next((j for j, (a, b) in enumerate(zip(actual[0], expected[0])) if a != b),
-                                        min(len(actual[0]), len(expected[0])))
-                        print(f"[分歧] 输出reference={expected[0]} {backend}/{mode}={actual[0]}")
-                        diagnose(baseline[0], s, f"r{i}", position, f"{backend}/{mode}")
-                        raise AssertionError("同成员同历史随机对照分歧")
-                if not force_eos:
-                    for rid, layers in s.saved.items():
-                        for actual, expected in zip(layers, baseline[0].saved[rid]):
-                            for a, b in zip(actual, expected):
+            if backend not in baselines:
+                if backend == "cuda":
+                    compare_traces(baselines["reference"][2], trace)
+                baselines[backend] = s, output, trace
+            baseline = baselines[backend]
+            compare_traces(baseline[2], trace)
+            for i, (actual, expected) in enumerate(zip(output, baseline[1])):
+                if actual[0] == expected[0]:
+                    assert actual[1] == expected[1], "相同输出却停止原因不同"
+                    if not force_eos:
+                        for a_layer, b_layer in zip(s.saved[f"r{i}"], baseline[0].saved[f"r{i}"]):
+                            for a, b in zip(a_layer, b_layer):
                                 torch.testing.assert_close(a, b, rtol=0, atol=0)
             for r in requests:
                 assert r.sampler.uniforms is None
                 if r.sampler.temperature > 0:
-                    assert set(range(len(r.output_ids))) <= s.draws[r.request_id].keys()
+                    assert all((r.sampler.seed, p) in trace["draws"] for p in range(len(r.output_ids)))
             if capacity:
                 assert s.graph_fallbacks > 0
             if len(set(limits)) > 1:

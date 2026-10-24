@@ -1,6 +1,7 @@
 """采样调用配对：微基准主矩阵，或--model测同一流水模式的模型整批完成。"""
 
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import statistics
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 import torch
 
 from ampere_kv.sampler import RequestSampler, sample_batch, cuda_topk, cuda_candidates
+from ampere_kv.check_sampler import capture_sampling, compare_traces, check_sampling
 
 
 def paired(functions, warmup, groups, iterations):
@@ -52,10 +54,14 @@ def micro(args, vocab):
                         1, vocab, "cuda", temperature=0.8, top_k=k, seed=42 + i, sampling_backend=backend))
                         for i in range(batch)]
                     functions[backend] = lambda requests=requests: sample_batch(logits, requests)
-                assert torch.equal(functions["reference"](), functions["cuda"]()), "采样不一致，先运行check_sampler定位"
+                temps = torch.full((batch,), 0.8, device="cuda")
+                uniforms = torch.stack([r.sampler.uniforms[0] for r in requests])
+                ref, cuda, acceptance = check_sampling(logits, temps, uniforms, k)
+                assert torch.equal(functions["reference"](), ref) and torch.equal(functions["cuda"](), cuda)
                 samples = paired(functions, args.warmup, args.groups, args.iterations)
                 medians = {name: statistics.median(values) for name, values in samples.items()}
-                row = dict(batch=batch, vocab=vocab, top_k=k, dtype=str(dtype), samples_us=samples, medians_us=medians)
+                row = dict(batch=batch, vocab=vocab, top_k=k, dtype=str(dtype), acceptance=acceptance,
+                           samples_us=samples, medians_us=medians)
                 if args.stages:
                     values, ids = cuda_topk(logits, k)
                     temps, uniforms = torch.full((batch,), 0.8, device="cuda"), torch.full((batch,), 0.5, device="cuda")
@@ -63,7 +69,7 @@ def micro(args, vocab):
                     row["event_stage_us"] = {"select": event_us(lambda: cuda_topk(logits, k), args.iterations),
                         "fused_reuse": event_us(lambda: cuda_candidates(values, ids, temps, uniforms, out), args.iterations)}
                 results.append(row)
-                print(f"[配对] B={batch} V={vocab} K={k} dtype={dtype} 样本us={samples} 中位us={medians}")
+                print(f"[配对] B={batch} V={vocab} K={k} dtype={dtype} 样本us={samples} 中位us={medians} 边界差异={acceptance['boundary']}")
                 if args.stages:
                     print(f"[阶段] CUDA Events 每调用跨度us={row['event_stage_us']}")
     return results
@@ -94,24 +100,34 @@ def model_bench(args):
         templates = [dict(id=f"t{i}", input_tokens=512, outputs=128,
                           gpu=torch.tensor([ids], device="cuda", dtype=torch.long)) for i, ids in enumerate(prompts[:batch])]
 
-        def execute(backend, outputs):
+        def execute(backend, outputs, diagnostic=False):
             scheduler.backend, scheduler.workload_serial = backend, 0
-            return run(scheduler, [t | {"outputs": outputs} for t in templates], batch,
-                       requests=batch, pipeline_mode=args.pipeline)
+            with capture_sampling() if diagnostic else nullcontext(None) as trace:
+                sample = run(scheduler, [t | {"outputs": outputs} for t in templates], batch,
+                             requests=batch, pipeline_mode=args.pipeline)
+            return (sample, trace) if diagnostic else sample
+
+        def cross_check(samples, outputs):
+            if samples[0]["output_sha256"] == samples[1]["output_sha256"]:
+                return []
+            diagnostics = [execute(backend, outputs, True) for backend in ("reference", "cuda")]
+            assert all(s["output_sha256"] == d[0]["output_sha256"] for s, d in zip(samples, diagnostics)), "同后端复跑不同"
+            return compare_traces(diagnostics[0][1], diagnostics[1][1])
 
         short = [execute(backend, 8) for backend in ("reference", "cuda")]
-        assert short[0]["output_sha256"] == short[1]["output_sha256"], "短模型输出不同，停止计时"
+        acceptance = dict(short=cross_check(short, 8))
         warm = [execute(backend, 128) for backend in ("reference", "cuda")]
-        assert warm[0]["output_sha256"] == warm[1]["output_sha256"], "128输出预热不同，停止计时"
+        acceptance["warm"] = cross_check(warm, 128)
+        expected = {name: sample["output_sha256"] for name, sample in zip(("reference", "cuda"), warm)}
         samples = {name: [] for name in ("reference", "cuda")}
         for repeat in range(3):
             for backend in (list(samples) if repeat % 2 == 0 else list(samples)[::-1]):
                 sample = execute(backend, 128)
-                assert sample["output_sha256"] == warm[0]["output_sha256"], "正式样本输出不同，停止计时"
+                assert sample["output_sha256"] == expected[backend], "同后端正式样本输出不同，停止计时"
                 samples[backend].append(sample)
         times = {name: [s["total_s"] * 1000 for s in values] for name, values in samples.items()}
         medians = {name: statistics.median(values) for name, values in times.items()}
-        results.append(dict(batch=batch, pipeline=args.pipeline, initialization_ms=initialization_ms,
+        results.append(dict(batch=batch, pipeline=args.pipeline, initialization_ms=initialization_ms, acceptance=acceptance,
                             input_file_sha256=file_hash, source_ids_sha256=source_hash, samples=samples, medians_ms=medians))
         print(f"[模型] B={batch} 输入512/输出128 temperature=0.8 K=40 seed=42+i "
               f"pipeline={args.pipeline} 初始化ms={initialization_ms:.3f} 样本ms={times} 中位ms={medians}")
