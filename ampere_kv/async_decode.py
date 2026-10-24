@@ -1,4 +1,4 @@
-"""借鉴ZOS依赖拆分的固定身份单步Decode流水；不是完整DeepInfer实现。"""
+"""固定请求身份的单步 Decode 流水，交叠当前前向与上一轮结果提交。"""
 
 from collections import Counter
 from contextlib import nullcontext
@@ -22,8 +22,7 @@ class Flight:
 class DecodePipeline:
     """B/C共用设备接续与双槽，仅改变提交时机；advance返回实际发射批量。
 
-    接口返回时最多一轮待提交；advance内部可先发射current，再提交previous，
-    临时最多两轮，故“前瞻一轮”不等于任意时刻只有一份未提交输出。
+    advance 先发射当前轮，再提交上一轮；内部最多两轮在途，返回时最多一轮。
     cache.length为已登记执行长度；CPU已提交长度是P+len(output_ids)-1。
     只通过advance/drain驱动；submit/cancel仍沿用Scheduler，禁止外部改running。
     """

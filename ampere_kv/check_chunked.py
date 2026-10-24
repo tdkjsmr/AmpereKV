@@ -99,7 +99,7 @@ def check_model(model, prompt, chunk=128):
                 logits = [model_forward(model, prompt.new_tensor([[token]]), position, caches,
                                         is_prefill=False, cuda_decode=True)
                           for token, caches in zip(ids, cache_sets)]
-        print("[PASS] 整段/分块短序列一致；logits仅观测，固定8个Token忽略EOS，不是完整精度验收")
+        print("[PASS] 整段/分块序列一致：固定生成8个Token，忽略EOS")
         return sequences[1]
     finally:
         for caches in cache_sets:
@@ -214,8 +214,7 @@ def main():
     check_interleaved(model, prompt, expected)
     print("[配置] 合作式停止用例：长请求 257 Token 按 Chunk=64 分块，短请求单独一条作对照")
     check_stop(model, prompt, ids)
-    print("[完成] 固定 Chunk 语义、交错调度与合作式取消/到期通过；"
-          "未验证抢占、SLO/P99、CUDA Graph 或性能")
+    print("[完成] 固定 Chunk、交错调度与合作式取消/到期检查通过")
 
 
 if __name__ == "__main__":

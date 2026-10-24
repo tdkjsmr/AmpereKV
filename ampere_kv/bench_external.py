@@ -328,7 +328,7 @@ def main():
             print(f"[Graph] 时间线批次计数={engine_config['graph_profile_counts']}")
     print(f"[指纹] 输入文件SHA256={file_hash}，选中Token SHA256={selected_hash}，提交={commit[:7]}")
     if times:
-        print("[边界] 离线整批完成与输出吞吐；不是 TTFT、TPOT、服务吞吐、P99 或 SLO")
+        print("[口径] 离线整批完成时间与输出吞吐")
     elif args.profile:
         print("[边界] 本次仅留 Nsight Systems 时间线与诊断输出，不报告无采样器的正式性能")
     else:

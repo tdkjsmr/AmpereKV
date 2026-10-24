@@ -1,4 +1,4 @@
-"""请求采样的独立参考与位置复现；--model另做短模型集成，不测性能。"""
+"""请求采样的独立参考与位置复现；--model 运行模型集成检查。"""
 
 import argparse
 import math
@@ -167,7 +167,7 @@ def check_model():
                         position = next((j for j, (a, b) in enumerate(zip(actual[0], expected[0])) if a != b),
                                         min(len(actual[0]), len(expected[0])))
                         diagnose(baseline[0], s, f"r{i}", position, mode)
-                        raise AssertionError("同成员同历史随机对照分歧，保留诊断，不放宽标准")
+                        raise AssertionError("同成员同历史随机对照分歧")
                 if not force_eos:
                     for rid, layers in s.saved.items():
                         for actual, expected in zip(layers, baseline[0].saved[rid]):
@@ -187,7 +187,7 @@ def check_model():
                     assert s.decode_pipeline.stats["discarded_tokens"] >= 1
             print(f"[PASS] 采样路径={mode} 历史={lengths}：位置0/Decode、输出/停止/KV及释放；批量={sorted(batches)}")
     check_stop_and_reuse(model, scheduler_type=RecordingScheduler)
-    print("[完成] 短模型采样集成；不保证跨batch模型logits/随机序列不变，不是质量或性能验收")
+    print("[完成] 请求级采样与模型集成检查通过")
 
 
 def main():

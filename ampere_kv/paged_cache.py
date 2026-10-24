@@ -28,11 +28,9 @@ class PagedKVStorage:
 
 
 class PagedKVCache:
-    """一个请求的块表与共享存储引用；已分配的块仍由该请求独占。
+    """单线程请求缓存，持有独占块表和共享存储引用。
 
-    单线程使用，不支持共享同一已分配块、引用计数或前缀复用。
-    请求结束必须显式 release；丢弃请求对象不会自动向共享池归还编号。
-    外部不能修改内部状态，输入 K/V 不能与物理存储共享内存。
+    请求结束调用 release 归还块；输入 K/V 使用独立于物理存储的张量。
     """
 
     def __init__(self, storage: PagedKVStorage):
@@ -44,7 +42,7 @@ class PagedKVCache:
 
     @property
     def capacity(self) -> int:
-        """返回整个共享池的 Token 容量，不保证本请求可全部占用；追加另查空闲块。"""
+        """共享池的总 Token 容量；追加时按空闲块分配。"""
         return self._key.shape[0] * self._key.shape[2]
 
     @property
@@ -174,7 +172,7 @@ def main() -> None:
     finally:
         cache.release()
     assert storage._pool.num_free_blocks == 2
-    print("[PASS] CPU分组K存储与跨块追加通过；K scale末维4，V末维1；未验证新布局CUDA、模型或性能")
+    print("[PASS] CPU分组K存储与跨块追加通过；K scale末维4，V末维1")
 
 
 if __name__ == "__main__":

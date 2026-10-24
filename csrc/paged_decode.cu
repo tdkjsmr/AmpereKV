@@ -12,7 +12,7 @@
 namespace {
 constexpr int kDim = 128;
 constexpr int kBlockSize = 16;
-constexpr int kSegmentSize = 64;  // 与此前 256 段长做单变量实验，不代表最终最优值。
+constexpr int kSegmentSize = 64;  // 每段处理的历史 Token 数。
 
 // 每线程连续四维的打包视图：BF16 走 8 字节，INT8 走 4 字节；起始地址都对齐到位宽。
 // 行首是 128 的整数倍，4*lane 再按元素宽度对齐，因此 reinterpret 后的宽载入合法。

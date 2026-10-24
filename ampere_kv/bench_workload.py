@@ -1,4 +1,4 @@
-"""闭环离线负载与同步/流水消融；报告固定工作量，不代表服务SLO或普遍加速。"""
+"""闭环离线负载与同步/流水消融基准。"""
 
 import argparse
 from collections import Counter, deque
@@ -329,9 +329,9 @@ def main():
               "templates": [{k: v for k, v in t.items() if k != "ids"} for t in templates],
               "blocks_per_layer": blocks, "pool_bytes": needed, "free_before_pool": free, "headroom_bytes": 1024**3,
               "timing": "profile_diagnostic_not_formal" if args.profile_rounds else "closed_loop_wallclock_with_driver",
-              "boundary": "闭环离线/ignoreEOS/BF16/V1/mixed关闭；驱动开销包含在内，非服务SLO或GPU纯耗时"}
+              "boundary": "闭环离线/ignoreEOS/BF16/V1/mixed关闭；包含宿主驱动、前向、输出提交与回收"}
     if needed + 1024**3 > free:
-        result.update(status="skipped_memory", reason="估算KV池加1GiB余量超过当前空闲显存，不保证通过预检即不会OOM")
+        result.update(status="skipped_memory", reason="估算KV池加1GiB余量超过当前空闲显存")
     else:
         for template in templates:
             template["gpu"] = torch.tensor([template.pop("ids")], dtype=torch.long, device="cuda")

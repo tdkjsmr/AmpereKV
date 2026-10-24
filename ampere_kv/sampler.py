@@ -1,4 +1,4 @@
-"""请求私有随机流与Graph外GPU选词；只保证固定环境、相同logits的采样复现。"""
+"""请求级随机流与模型 Graph 外的 GPU 选词。"""
 
 import math
 import secrets

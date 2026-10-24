@@ -382,7 +382,7 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS,
 
     if verify:
         print(f"reference_token_ids = {reference_ids}")
-        print("[PASS] 本次逐步 logits、完整 Token 序列与缓存检查通过；不代表性能验证通过")
+        print("[PASS] 逐步 logits、完整 Token 序列与缓存检查通过")
         if cache_kind == "paged":
             crossed = (used_tokens - 1) // PAGED_BLOCK_SIZE > (tokens - 1) // PAGED_BLOCK_SIZE
             print(f"分页块大小={PAGED_BLOCK_SIZE}，Prefill 长度={tokens}，最终 KV 长度={used_tokens}，Decode 跨块={crossed}")
@@ -461,7 +461,7 @@ def main() -> None:
     if len(generated_ids) == 1:
         print("首个 Token 为 EOS，本次未覆盖 Decode")
     if args.mode == "generate":
-        print("纯生成完成；未执行 HF 对照或性能测量")
+        print("生成完成")
 
 
 if __name__ == "__main__":

@@ -308,7 +308,7 @@ def main():
     drive(model, [16], [20], 1, 32)
     drive(model, [17] * 4, [8] * 4, 4, 64)
     drive(model, [17] * 4, [8] * 4, 4, 64, lifecycle=True)
-    print("[完成] 固定 B1/B4 Graph 调度接入检查；未验证动态批次Graph、INT8/V3、混合轮或性能")
+    print("[完成] 固定 B1/B4 Graph 调度检查通过")
 
 
 if __name__ == "__main__":

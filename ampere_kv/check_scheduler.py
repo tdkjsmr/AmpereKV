@@ -155,8 +155,7 @@ def main() -> None:
     base = prompts[0]
     check_batched(model, [base, base.repeat(1, 3), base.repeat(1, 6), prompts[1].repeat(1, 2), prompts[2]],
                   (3, 6, 4, 8, 2), 4)
-    print("[完成] 整段 Prefill 模式的既有回归通过；分块检查请运行 ampere_kv.check_chunked；"
-          "未验证 CUDA Graph、取消与超时或性能")
+    print("[完成] 整段 Prefill 与批量 Decode 调度检查通过")
 
 
 if __name__ == "__main__":

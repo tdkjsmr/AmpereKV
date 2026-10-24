@@ -19,8 +19,8 @@ def benchmark() -> None:
     begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     print(f"调用基线：Q头=32，KV头=8，每头128维，块大小16；预热={warmup} 次，测量={repeats} 组，每组={iterations} 次")
     print("Q/K/V、量化、GQA 展开与 GPU 块表都在计时外准备；被测的是内部入口，与模型生成路径一致，无宿主块号同步。")
-    print("墙钟含 Python/扩展调用、输出分配与组末等待；GPU 窗口是同一批调用的 CUDA Event 区间，仍含 GPU 等待 CPU")
-    print("派发的空隙，因此不是严格纯内核时间。同一份数据反复读取可能受硬件缓存影响；结果不是请求 TPOT 或原生 GQA 性能。")
+    print("墙钟包含 Python/扩展调用、输出分配与组末等待；CUDA Event 测量同组调用的设备时间窗口，包含派发间隙。")
+    print("各组重复读取相同数据。")
     print("CUDA 段长=64；长度超过 64 时启用分段，临时结果分配与合并调用均计入；修改段长后须重新编译扩展。")
     print("V1=每块一个 Query 头，V3=同组四个 Query 头共享一次 K/V 载入；两者在同一轮内交替测量，V1 仍是默认路径。")
     for length in (64, 256, 1024, 4096):
@@ -221,7 +221,7 @@ def check_int8() -> None:
             cache.release()
         assert storage._pool.num_free_blocks == blocks
         print("[PASS] INT8 融合数值对照、非法输入拒绝和块归还通过")
-    print("[PASS] INT8批量Prefill写入与Decode追加六个场景通过；未验证模型、长上下文或性能")
+    print("[PASS] INT8批量Prefill写入与Decode追加六个场景通过")
 
 
 def main() -> None:

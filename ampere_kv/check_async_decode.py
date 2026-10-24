@@ -177,7 +177,7 @@ def main():
     assert s.decode_pipeline.pending is None and len(requests[0].output_ids) == before + 1
     finish(s, requests)
     print("[PASS] 显式drain提交最后在途结果，随后可重入；跨块、序列及缓冲轮换已覆盖")
-    print("[完成] 单步流水正确性用例；实际重叠与性能仍须独立Nsight/无采集ABC验证")
+    print("[完成] 单步流水正确性检查通过")
 
 
 if __name__ == "__main__":
