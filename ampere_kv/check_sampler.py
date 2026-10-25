@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import torch
 
 from ampere_kv.sampler import (RequestSampler, distribution, sample_batch, sample_uniform,
-                               cuda_topk, cuda_candidates)
+                               cuda_topk, cuda_candidates, cumulative_probabilities)
 
 
 def reference(logits, temperature, top_k, uniform):
@@ -110,6 +110,11 @@ def boundary_intervals(left, right, uniform, a, b):
     return intervals
 
 
+def reference_cdf(probabilities):
+    total = math.fsum(probabilities)
+    return [math.fsum(probabilities[:i + 1]) / total for i in range(len(probabilities))]
+
+
 def check_candidates(values, ids, temperatures, uniforms):
     """仅供检查：独立FP64概率、累计概率与各自区间选词。"""
     k = values.shape[1]
@@ -119,16 +124,17 @@ def check_candidates(values, ids, temperatures, uniforms):
     for row, (scores, t, u) in enumerate(zip(values, temperatures.tolist(), uniforms.tolist())):
         _, independent, _ = reference(scores, t, -1, u)
         _, ref_probs = distribution(scores, t, -1)
-        ref_cdf = ref_probs.cumsum(0).clamp_max_(1); ref_cdf[-1] = 1
+        ref_cdf = cumulative_probabilities(ref_probs)
         p, q = ref_probs.tolist(), probs[row].tolist()
         left, right = ref_cdf.tolist(), cdf[row].tolist()
-        truth = [min(1.0, math.fsum(independent[:i + 1])) for i in range(k)]; truth[-1] = 1.0
-        accumulated = [min(1.0, math.fsum(q[:i + 1])) for i in range(k)]; accumulated[-1] = 1.0
+        truth = reference_cdf(independent)
+        accumulated = reference_cdf(q)
         for actual in (p, q):
             torch.testing.assert_close(torch.tensor(actual), torch.tensor(independent), rtol=2e-6, atol=1e-7)
-        for actual in (left, right):
-            assert all(math.isfinite(x) and 0 <= x <= 1 for x in actual) and actual[-1] == 1
-            assert all(a <= b for a, b in zip(actual, actual[1:]))
+        for label, actual in (("reference", left), ("cuda", right)):
+            assert all(math.isfinite(x) and 0 <= x <= 1 for x in actual) and actual[-1] == 1, (label, row, "CDF范围/尾项")
+            drops = [(i, a, b) for i, (a, b) in enumerate(zip(actual, actual[1:])) if a > b]
+            assert not drops, ("CDF非单调", label, row, drops)
         error = max(abs(a - b) for x, y in ((left, truth), (right, truth), (left, right), (right, accumulated))
                     for a, b in zip(x, y))
         assert error <= 1e-6, ("CDF绝对误差", error)
@@ -136,6 +142,8 @@ def check_candidates(values, ids, temperatures, uniforms):
         b = next((i for i, x in enumerate(right) if x > u), k - 1)
         ref_token = sample_uniform(scores, t, -1, uniforms[row])
         assert ref_token.item() == a and out[row].item() == ids[row, b].item(), ("选词不符合自身CDF", row, u, a, b)
+        if 0 <= u < 1:
+            assert p[a] > 0 and q[b] > 0, ("选中零概率候选", row, u, a, b)
         reference_tokens.append(ids[row, a])
         if a != b:
             stats["intervals"].append((row, u, boundary_intervals(left, right, u, a, b)))
@@ -151,6 +159,46 @@ def check_sampling(logits, temperatures, uniforms, k):
     assert torch.equal(ids, ordered[:, :k]), "候选ID/顺序不同"
     torch.testing.assert_close(values, scores[:, :k], rtol=0, atol=0)
     return check_candidates(values, ids, temperatures, uniforms)
+
+
+def check_zero_tail(device, vocab=None):
+    for count in (38, 41):
+        p = torch.zeros(128, device=device)
+        p[:count] = 1 / count
+        cdf = cumulative_probabilities(p)
+        truth = torch.tensor(reference_cdf(p.tolist()), device=device, dtype=torch.float32)
+        torch.testing.assert_close(cdf, truth, rtol=0, atol=0)
+        assert (cdf[1:] >= cdf[:-1]).all() and (cdf[count - 1:] == 1).all()
+        old = p.cumsum(0, dtype=torch.float64).float(); old[-1] = 1
+        edge = old[count - 1]
+        if count == 41:
+            assert torch.searchsorted(old, edge, right=True).item() == 127
+            assert torch.searchsorted(cdf, edge, right=True).item() == 40
+        one, zero = p.new_tensor(1.0), p.new_tensor(0.0)
+        probes = [zero, edge, torch.nextafter(edge, zero), torch.nextafter(edge, one),
+                  cdf[count - 1], torch.nextafter(cdf[count - 1], zero), torch.nextafter(one, zero)]
+        for u in probes:
+            if 0 <= u.item() < 1:
+                index = torch.searchsorted(cdf, u, right=True)
+                assert index.item() < count and p[index] > 0
+        if vocab is not None:
+            x = torch.full((1, vocab), -3e38, device=device, dtype=torch.float32)
+            if count == 38:
+                x[:, ::4096] = 3e38  # 保留原38项故障输入的物理位置。
+            else:
+                x[:, :count] = 3e38
+            t, out = p.new_tensor([0.6]), torch.empty(1, device=device, dtype=torch.long)
+            values, ids = cuda_topk(x, 128)
+            q, actual = cuda_candidates(values, ids, t, zero[None], out)
+            assert (q[0, :count] > 0).all() and (q[0, count:] == 0).all()
+            assert (actual[0, count - 1:] == 1).all()
+            last = actual[0, count - 1]
+            probes += [last, torch.nextafter(last, zero), torch.nextafter(last, one)]
+            for u in probes:
+                if 0 <= u.item() < 1:
+                    check_sampling(x, t, u[None], 128)
+            print(f"[诊断] CUDA零尾部：非零项={count}，实际概率总量={math.fsum(q[0].tolist()):.17g}")
+    print(f"[PASS] {'CUDA与参考' if vocab is not None else '参考'}38/41项零尾部、实际总量归一化与近1选词")
 
 
 @contextmanager
@@ -218,6 +266,7 @@ def check_cuda():
     from transformers import AutoConfig
     from ampere_kv.runner import MODEL_ID, MODEL_REVISION
     vocab = AutoConfig.from_pretrained(MODEL_ID, revision=MODEL_REVISION, local_files_only=True).vocab_size
+    check_zero_tail("cuda", vocab)
     generator = torch.Generator(device="cuda").manual_seed(99)
     summary = {name: dict(samples=0, boundary=0, max_cdf_abs=0.0) for name in ("random", "boundary")}
     for batch in (1, 4):
@@ -242,9 +291,7 @@ def check_cuda():
                         torch.testing.assert_close(values, scores[:, :k], rtol=0, atol=0)
                         temperatures = torch.linspace(0.6, 1.2, batch, device="cuda")
                         expected = [distribution(row, t.item(), -1)[1] for row, t in zip(values, temperatures)]
-                        cdfs = [p.cumsum(-1).clamp_max_(1) for p in expected]
-                        for c in cdfs:
-                            c[-1] = 1
+                        cdfs = [cumulative_probabilities(p) for p in expected]
                         reference_cdf = torch.stack(cdfs)
                         edge = reference_cdf[:, k // 2]
                         uniforms = [torch.zeros_like(edge), torch.full_like(edge, 1 - 2**-24),
@@ -257,6 +304,8 @@ def check_cuda():
                                      torch.nextafter(other_edge, torch.ones_like(edge)), (edge + other_edge) * 0.5]
                         for name, u in [("boundary", u) for u in uniforms] + [
                                 ("random", torch.rand(batch, device="cuda", generator=generator)) for _ in range(4)]:
+                            if not ((u >= 0) & (u < 1)).all():
+                                continue  # 1及其上邻不是合法随机数，端点由CDF检查覆盖。
                             try:
                                 _, tokens, stats = check_candidates(values, ids, temperatures, u)
                             except AssertionError as error:
@@ -368,6 +417,7 @@ def main():
     args = parser.parse_args()
     check_probabilities("cuda")
     check_positions("cuda")
+    check_zero_tail("cuda")
     if args.sampling_backend == "cuda":
         check_cuda()
     if args.model:

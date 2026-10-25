@@ -67,11 +67,11 @@ pipeline = scheduler.enable_pipeline(overlap=True)
 
 位置 0 对应 Prefill 首 Token。同步路径按已提交输出数索引，流水发射按 `flight.targets - 1` 索引。随机数按位置读取，前瞻、丢弃和回退沿用这一位置约定。
 
-GPU 选词在模型 Graph 外进行：有限 BF16/FP32 logits 转 FP32，按分数降序、同分 Token ID 升序排列，保留 top-k 后计算稳定 softmax，再用逆 CDF 选词。CDF 尾项修正为 1，处理累积舍入。结果留在设备槽中供下一轮读取。
+GPU 选词在模型 Graph 外进行：有限 BF16/FP32 logits 转 FP32，按分数降序、同分 Token ID 升序排列，保留 top-k 后计算稳定 softmax，再用逆 CDF 选词。两后端都用 FP64 累计已有 FP32 概率，除以该累计的实际总量后转回 FP32；零概率尾部保持平坦，末端为 1。结果留在设备槽中供下一轮读取。
 
 固定环境和采样后端下，相同 logits、参数、seed 和位置可复现采样。不同后端可能在累计概率（CDF）分界附近选中不同候选。设计参考 DeepInfer 的[请求参数](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/sampling_params.py)与[采样层](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py)；本项目独立实现请求随机流与逆 CDF 选词。
 
-`sampling_backend="reference"` 保留稳定排序参考；显式 `cuda` 对同 K 的 B1/B4、K40/128 使用 `csrc/sampling.cu`。每2048个分数由256线程处理：线程内排序8个键，全块反复取最大值保留K项，再按各段有序队首归并。键组合FP32有序位与反向ID，同分取小ID，正负零统一，越界尾项不参与候选。随后一个warp融合温度、softmax、CDF与选词；概率为FP32，前缀用double累积再写回FP32。其余情况回参考，全greedy仍用批量argmax。
+`sampling_backend="reference"` 保留稳定排序参考；显式 `cuda` 对同 K 的 B1/B4、K40/128 使用 `csrc/sampling.cu`。每2048个分数由256线程处理：线程内排序8个键，全块反复取最大值保留K项，再按各段有序队首归并。键组合FP32有序位与反向ID，同分取小ID，正负零统一，越界尾项不参与候选。随后一个warp融合温度、softmax、CDF与选词；FP32概率输出保持原义，选词的累计值按其实际总量归一化。其余情况回参考，全greedy仍用批量argmax。
 
 CUDA后端复用请求uniform及逻辑位置，缓存设备温度；组批和临时分配在模型Graph外、当前CUDA流执行，结果写回原设备槽。算法划分参考 DeepInfer [`process_sampling`](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler_utils.py) 的候选缩减/融合阶段及 [DeepSelect](https://github.com/deepseek-ai/DeepSelect/tree/bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18) 的大词表小K场景；实现独立编写，不依赖它们的运行库。候选ID/分数精确对齐，概率沿用rtol=2e-6、atol=1e-7；CDF对独立FP64参考及两侧之间的绝对误差上限为1e-6。各自选词须精确符合各自CDF，跨后端差异只接受0到1之间的均匀随机数落在实际移动分界区间内的情况，不向生产随机数添加偏移。模型只诊断首次分叉的相同输入，诊断不计入配对性能。
 

@@ -15,11 +15,18 @@ def distribution(logits, temperature, top_k):
     return ids, probabilities
 
 
+def cumulative_probabilities(probabilities):
+    """用FP64累计并按实际总量归一化，零概率尾部保持平坦。"""
+    prefix = probabilities.cumsum(dim=-1, dtype=torch.float64)
+    cdf = (prefix / prefix[..., -1:]).float()
+    cdf[..., -1] = 1
+    return cdf
+
+
 def sample_uniform(logits, temperature, top_k, uniform):
     """给定[0,1)的uniform，取首个CDF严格大于它的候选。"""
     ids, probabilities = distribution(logits, temperature, top_k)
-    cdf = probabilities.cumsum(dim=-1).clamp_max_(1)
-    cdf[-1] = 1  # FP32累积舍入不能让末尾抽样落出候选集。
+    cdf = cumulative_probabilities(probabilities)
     index = torch.searchsorted(cdf, uniform, right=True).clamp_max(ids.numel() - 1)
     return ids.gather(0, index.reshape(1)).squeeze(0)
 

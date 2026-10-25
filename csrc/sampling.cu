@@ -108,12 +108,14 @@ __global__ void sample_candidates(const float* values, const int64_t* ids, const
   }
   __syncwarp();
   if (lane == 0) {
-    double prefix = 0;
+    // 按已输出的FP32概率实际总量归一化，不能只给末项补1。
+    double total = 0, prefix = 0;
+    for (int i = 0; i < k; ++i) total += weights[i];
     int chosen = k - 1;
     bool found = false;
     for (int i = 0; i < k; ++i) {
       prefix += weights[i];
-      float cumulative = i == k - 1 ? 1.0f : fminf(1.0f, static_cast<float>(prefix));
+      float cumulative = static_cast<float>(prefix / total);
       cdf[row * k + i] = cumulative;
       if (!found && uniforms[row] < cumulative) { chosen = i; found = true; }
     }
