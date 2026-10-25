@@ -33,6 +33,7 @@ class Request:
         self.caches: list[PagedKVCache] = []
         self.output_ids: list[int] = []
         self.stop_reason = ""
+        self.structured_complete = False
 
 
 class Scheduler:
@@ -107,7 +108,7 @@ class Scheduler:
     def submit(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int,
                ignore_eos: bool = False, deadline: float | None = None, *,
                temperature: float = 0.0, top_k: int = -1, seed: int | None = None,
-               sampling_backend: str = "reference") -> Request:
+               sampling_backend: str = "reference", structured=None) -> Request:
         """边界校验集中在提交时；内部模型调用不再重复检查自己产出的形状与设备。
 
         `deadline` 是同一进程 `time.monotonic()` 上的绝对时刻，None 表示不设限、走原有路径。
@@ -126,10 +127,17 @@ class Scheduler:
             raise ValueError(f"单请求预算 {need} 块超过每层容量 {self.blocks_per_layer} 块")
         if self.mixed and temperature != 0:
             raise ValueError("随机采样暂不支持mixed模式")
+        if structured is not None:
+            if (self.decode_pipeline is not None or self.graphs is not None or self.mixed
+                    or self.prefill_chunk_size or ignore_eos or sampling_backend != "reference"):
+                raise ValueError("结构化请求仅支持整段Prefill、同步eager、reference采样及正常EOS")
+            if structured.vocab_size != self.model.config.vocab_size or set(structured.stop_token_ids) != self.eos_ids:
+                raise ValueError("编译语法的词表与停止Token必须匹配模型")
         request = Request(request_id, input_ids, max_new_tokens, need, ignore_eos, deadline)
         request.sampler = RequestSampler(max_new_tokens, self.model.config.vocab_size, self.device,
                                          temperature=temperature, top_k=top_k, seed=seed,
-                                         sampling_backend=sampling_backend)
+                                         sampling_backend=sampling_backend,
+                                         structured=structured.new_state(self.device) if structured is not None else None)
         self._submitted = True
         self.waiting.append(request)
         return request
@@ -145,9 +153,14 @@ class Scheduler:
 
     def _commit(self, request: Request, token: int) -> None:
         """收下本轮选出的 Token 并判断停止；EOS 与达到上限只写 stop_reason，不加新状态。"""
+        structured = request.sampler.structured
+        if structured is not None:
+            request.structured_complete = structured.accept(token)
         request.output_ids.append(token)
-        if len(request.output_ids) >= request.max_new_tokens:
-            request.stop_reason = "达到生成上限"
+        if request.structured_complete:
+            request.stop_reason = "EOS"
+        elif len(request.output_ids) >= request.max_new_tokens:
+            request.stop_reason = "达到生成上限（结构化截断）" if structured is not None else "达到生成上限"
         elif token in self.eos_ids and not request.ignore_eos:
             request.stop_reason = "EOS"
 

@@ -8,6 +8,7 @@ setup(
     name="ampere-kv-engine",
     version="2.0.1",
     packages=["ampere_kv"],
+    extras_require={"structured": ["xgrammar==0.1.18"]},
     ext_modules=[
         CUDAExtension(
             name="ampere_kv._C",

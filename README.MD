@@ -54,6 +54,29 @@ python -m ampere_kv.runner --mode generate --cache paged --temperature 0.8 --top
 
 异步基准用 `bench_workload --mode steady --cuda-graph --pipeline a|b|c|abc` 选择同步、设备接续同步、跨轮重叠或三路配对。完整命令见[单步流水报告](docs/BENCHMARK.md#di-02受限单步流水消融f5d5c33)。
 
+### JSON Schema 约束输出
+
+可选依赖为 `xgrammar==0.1.18`（extra 名 `structured`）。在已有环境中安装该固定版本后，用 `python -m ampere_kv.check_structured_output` 检查 tokenizer 与掩码，添加 `--model` 运行模型演示。
+
+```python
+from ampere_kv.runner import load_model_and_tokenizer, encode_prompt
+from ampere_kv.scheduler import Scheduler
+from ampere_kv.structured_output import SchemaCompiler
+
+model, tokenizer = load_model_and_tokenizer()
+scheduler = Scheduler(model, blocks_per_layer=32, max_batch=2)
+compiler = SchemaCompiler(tokenizer, model.config.vocab_size, scheduler.eos_ids)
+grammar = compiler.compile({"type": "object", "properties": {"approved": {"type": "boolean"}},
+                            "required": ["approved"], "additionalProperties": False})
+request = scheduler.submit("json", encode_prompt(tokenizer, "只返回JSON，字段approved为布尔值。"),
+                           64, structured=grammar, temperature=0.8, top_k=40, seed=42)
+while request.status != "finished":
+    scheduler.step()
+print(tokenizer.decode(request.output_ids, skip_special_tokens=True), request.stop_reason)
+```
+
+编译结果可复用，每请求独占 matcher 与掩码。首 Token 起按 Schema 过滤，EOS 表示语法完整结束；输出上限提前到达时报告“结构化截断”，保留原文本。支持 BF16/V1、整段 Prefill、同步 eager 和 reference 采样，允许不同 Schema 与普通请求共存。结构化请求在提交时拒绝 Graph、流水、mixed、分块 Prefill、ignore_eos 与 CUDA 采样；普通请求保持原用法。不安装可选依赖也能运行普通请求。
+
 ## 阅读与测试
 
 执行主线：`runner.py`（模型前向）→ `scheduler.py`（调度）→ `paged_cache.py`（缓存）→ `graph_decode.py`（Graph）。`async_decode.py` 管理跨轮流水，`sampler.py` 管理请求级采样。

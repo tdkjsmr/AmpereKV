@@ -53,7 +53,7 @@ class RequestSampler:
     """位置0是Prefill首Token；uniform只读索引，前瞻/丢弃不推进共享游标。"""
 
     def __init__(self, max_tokens, vocab_size, device, *, temperature=0.0, top_k=-1, seed=None,
-                 sampling_backend="reference"):
+                 sampling_backend="reference", structured=None):
         limits = torch.finfo(torch.float32)
         if not math.isfinite(temperature) or not (temperature == 0 or limits.tiny <= temperature <= limits.max):
             raise ValueError("temperature须为0（greedy）或FP32正规正数范围的有限值")
@@ -64,6 +64,7 @@ class RequestSampler:
         if sampling_backend not in ("reference", "cuda"):
             raise ValueError("sampling_backend须为reference或cuda")
         self.backend = sampling_backend
+        self.structured = structured
         self.temperature, self.top_k = temperature, top_k
         self.seed = seed if seed is not None or temperature == 0 else secrets.randbits(32)
         self.uniforms = None
@@ -76,6 +77,8 @@ class RequestSampler:
                 self.temperature_device = torch.tensor([temperature], dtype=torch.float32, device=device)
 
     def sample(self, logits, position, *, sampling_backend=None):
+        if self.structured is not None:
+            self.structured.mask(logits)
         if self.temperature == 0:
             return logits.argmax()
         if (sampling_backend or self.backend) == "cuda" and self.top_k in (40, 128) and logits.numel() <= 524288:
@@ -83,12 +86,18 @@ class RequestSampler:
         return sample_uniform(logits, self.temperature, self.top_k, self.uniforms[position])
 
     def release(self):
+        if self.structured is not None:
+            self.structured.release()
+            self.structured = None
         self.uniforms = None
         self.temperature_device = None
 
 
 def sample_batch(logits, requests, positions=None, out=None):
     if all(r.sampler.temperature == 0 for r in requests):
+        for row, r in zip(logits, requests):
+            if r.sampler.structured is not None:
+                r.sampler.structured.mask(row)
         return torch.argmax(logits, dim=-1, out=out)
     positions = positions if positions is not None else [len(r.output_ids) for r in requests]
     states = [r.sampler for r in requests]

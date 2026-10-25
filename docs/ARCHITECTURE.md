@@ -77,6 +77,10 @@ CUDA后端复用请求uniform及逻辑位置，缓存设备温度；组批和临
 
 ## 检查与测量
 
+`structured_output.py` 使用可选XGrammar 0.1.18公开API：调用方用真实tokenizer、模型logits词表大小和模型停止Token构造编译器；CompiledSchema可复用，RequestSampler独占每请求的matcher与CPU/GPU bitmask。CPU生成合法掩码并排除补齐编号，GPU在argmax/Top-K前将非法分数设为负无穷。空合法集合直接报错，不解除约束。
+
+结构化请求只接同步eager reference路径，组合限制在submit集中检查。`_commit`对实际Token调用一次accept_token，接受停止Token后标记语法完整；达到上限则标记截断。`_retire`沿原sampler.release释放语法与掩码，取消/到期复用同一释放点。普通请求不导入XGrammar。接口机制参考[DeepInfer结构化输出](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/structure_output)，不引入其异步编译/触发/回滚层。
+
 `check_model.py` 提供 CUDA/INT8 模型对照，`runner --mode check` 开启 HF 逐步对照。调度、分块、混合前向、Graph、流水和采样各有对应的 `check_*` 入口。
 
 `bench_external.py` 测量离线整批完成时间，`bench_workload.py` 测量闭环负载与流水消融，`paged_decode.py` 提供算子数值检查及调用基准。
