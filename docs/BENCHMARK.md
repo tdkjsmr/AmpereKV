@@ -199,6 +199,37 @@ nsys export --type sqlite --output "$BENCH_DIR/c-profile.sqlite" "$BENCH_DIR/c-p
 
 本项目独立实现固定请求身份的单步流水，参考 [DeepInfer 固定提交774ce244](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01) 的 [`worker.execute_model_step`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/worker.py)（current-forward / previous-post）及 [`prepare_tensor_input_zos.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/input_metadata/prepare_tensor_input_zos.py)（设备 Token 接续）。参考项目使用 [Apache-2.0 许可证](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/LICENSE)。
 
+## 同步结构化输出（6ea7014）
+
+实测源码为 `6ea7014d03c8d856c679e74a5230ebab3deff4d4`，Run ID 为 `di05b-paired-01`。同一 RTX 3090，PyTorch `2.5.1+cu124`、CUDA `12.4`、Transformers `4.51.0`、XGrammar `0.1.18`；固定 Qwen/Qwen3-8B Revision `b968826d9c46dd6066d109eabc6255188de91218`。
+
+输入长度为 B1 `[25]`、B4 `[25,26,26,27]` Token，使用仅含必需布尔字段 `approved`、不允许额外字段的 APPROVAL JSON Schema。三路径共用输入、Schema 和请求参数：温度 `0.8`、K=`40`、seed=`42+i`（i从0起），生成上限64、自然EOS；每请求实际输出6 Token，包含EOS。
+
+`eager-reference` 使用同步eager前向与参考采样；`graph-reference` 使用同步Graph与参考采样；`graph-cuda` 使用同步Graph与CUDA采样。Graph沿用固定B1/B4，其他批量回退eager；CUDA沿用同K批量快路径及异构回退。每路径预热1次，按三路径正序→逆序→正序各测1组，共18个正式样本。计时从submit到整批输出已回宿主且资源释放，包含matcher初始化、逐步掩码/传输/采样/提交；模型加载、输入准备、语法编译、建池与Graph捕获在计时外，JSON校验和文本解码在计时后。
+
+| B | 路径 | 三次整批完成时间（ms） | 中位数（ms） |
+|---:|---|---|---:|
+| 1 | eager-reference | 189.628, 189.971, 190.602 | 189.971 |
+| 1 | graph-reference | 155.336, 155.542, 155.292 | 155.336 |
+| 1 | graph-cuda | 154.168, 154.275, 154.398 | 154.275 |
+| 4 | eager-reference | 405.230, 410.247, 406.784 | 406.784 |
+| 4 | graph-reference | 375.447, 374.695, 376.360 | 375.447 |
+| 4 | graph-cuda | 371.166, 371.141, 372.669 | 371.166 |
+
+按未舍入中位数计算，Graph相对eager的耗时下降为B1 **18.23%**、B4 **7.70%**；Graph后增加CUDA采样再下降 **0.68%/1.14%**（1.060/4.280ms），合计相对eager下降 **18.79%/8.76%**。结果对应上述短输入、紧凑JSON与同步执行配置。
+
+三路径在同批量的完整输出和工作量一致，均生成合法 `{"approved":true}`、正常EOS并完成回收。B1的5次Decode全部命中Graph；B4共20个Decode Token、8次前向，其中B1/B4各2次命中、B2/B3各2次回退，仍有四次整段Prefill。
+
+初始化单列：B1/B4语法编译分别83.576/83.226ms；建池与捕获的墙钟按eager-reference、graph-reference、graph-cuda顺序分别为B1 `1.263/503.618/203.608 ms`、B4 `1.617/419.308/417.436 ms`。这些初始化不计入表中正式样本。
+
+按README准备当前开发分支、固定模型缓存和XGrammar依赖后，运行既有入口；结果路径须在仓库外：
+
+```bash
+python -m ampere_kv.check_structured_output --model
+python -m ampere_kv.bench_structured_output --batches 1 4 \
+  --output /absolute/path/structured.json --run-id structured-repro-01
+```
+
 ## 复现说明
 
 整批测量入口为 `bench_external`，算子基准为 `paged_decode --benchmark`，流水消融入口和命令见上节。元数据合并上传版本完整标识为 `0ac0d950f31720ce47fa99a834bd98e2e33b5096`。
