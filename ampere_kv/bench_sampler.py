@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import torch
 
-from ampere_kv.sampler import RequestSampler, sample_batch, cuda_topk, cuda_candidates
+from ampere_kv.sampler import RequestSampler, sample_batch
 from ampere_kv.check_sampler import capture_sampling, compare_traces, check_sampling
 
 
@@ -30,15 +30,6 @@ def paired(functions, warmup, groups, iterations):
             torch.cuda.synchronize()
             samples[name].append((time.perf_counter() - start) * 1e6 / iterations)
     return samples
-
-
-def event_us(fn, iterations):
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        fn()
-    end.record(); end.synchronize()
-    return start.elapsed_time(end) * 1000 / iterations
 
 
 def micro(args, vocab):
@@ -62,16 +53,8 @@ def micro(args, vocab):
                 medians = {name: statistics.median(values) for name, values in samples.items()}
                 row = dict(batch=batch, vocab=vocab, top_k=k, dtype=str(dtype), acceptance=acceptance,
                            samples_us=samples, medians_us=medians)
-                if args.stages:
-                    values, ids = cuda_topk(logits, k)
-                    temps, uniforms = torch.full((batch,), 0.8, device="cuda"), torch.full((batch,), 0.5, device="cuda")
-                    out = torch.empty(batch, device="cuda", dtype=torch.long)
-                    row["event_stage_us"] = {"select": event_us(lambda: cuda_topk(logits, k), args.iterations),
-                        "fused_reuse": event_us(lambda: cuda_candidates(values, ids, temps, uniforms, out), args.iterations)}
                 results.append(row)
                 print(f"[配对] B={batch} V={vocab} K={k} dtype={dtype} 样本us={samples} 中位us={medians} 边界差异={acceptance['boundary']}")
-                if args.stages:
-                    print(f"[阶段] CUDA Events 每调用跨度us={row['event_stage_us']}")
     return results
 
 
@@ -143,7 +126,6 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--groups", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--stages", action="store_true")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     if min(args.warmup, args.groups, args.iterations) < 1 or (args.model and args.input is None):
@@ -162,7 +144,7 @@ def main():
                             dict(temperature=0.8, warmup=args.warmup, groups=args.groups, iterations=args.iterations))
     print(f"[配置] {metadata}")
     print("[口径] 微基准含完整采样调用及输出/临时分配，输入与uniform在计时外，同数据重复读；组末等待。"
-          "阶段Events的select含分配、fused复用候选/输出，与宿主时间分开。模型含提交、取回与排空，初始化/预热单列。")
+          "模型含提交、取回与排空，初始化/预热单列。")
     with torch.inference_mode():
         result = metadata | {"results": model_bench(args) if args.model else micro(args, vocab)}
     if args.output:
