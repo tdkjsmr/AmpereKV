@@ -67,7 +67,7 @@ pipeline = scheduler.enable_pipeline(overlap=True)
 
 位置 0 对应 Prefill 首 Token。同步路径按已提交输出数索引，流水发射按 `flight.targets - 1` 索引。随机数按位置读取，前瞻、丢弃和回退沿用这一位置约定。
 
-GPU 选词在模型 Graph 外进行：有限 BF16/FP32 logits 转 FP32，按分数降序、同分 Token ID 升序排列，保留 top-k 后计算稳定 softmax，再用逆 CDF 选词。两后端都用 FP64 累计已有 FP32 概率，除以该累计的实际总量后转回 FP32；零概率尾部保持平坦，末端为 1。结果留在设备槽中供下一轮读取。
+GPU 选词在模型 Graph 外进行：BF16/FP32 logits（含语法过滤的负无穷项）转 FP32，按分数降序、同分 Token ID 升序排列，保留 top-k 后计算稳定 softmax，再用逆 CDF 选词。两后端都用 FP64 累计已有 FP32 概率，除以该累计的实际总量后转回 FP32；零概率尾部保持平坦，末端为 1。结果留在设备槽中供下一轮读取。
 
 固定环境和采样后端下，相同 logits、参数、seed 和位置可复现采样。不同后端可能在累计概率（CDF）分界附近选中不同候选。设计参考 DeepInfer 的[请求参数](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/sampling_params.py)与[采样层](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py)；本项目独立实现请求随机流与逆 CDF 选词。
 
@@ -79,7 +79,9 @@ CUDA后端复用请求uniform及逻辑位置，缓存设备温度；组批和临
 
 `structured_output.py` 使用可选XGrammar 0.1.18公开API：调用方用真实tokenizer、模型logits词表大小和模型停止Token构造编译器；CompiledSchema可复用，RequestSampler独占每请求的matcher与CPU/GPU bitmask。CPU生成合法掩码并排除补齐编号，GPU在argmax/Top-K前将非法分数设为负无穷。空合法集合直接报错，不解除约束。
 
-结构化请求只接同步eager reference路径，组合限制在submit集中检查。`_commit`对实际Token调用一次accept_token，接受停止Token后标记语法完整；达到上限则标记截断。`_retire`沿原sampler.release释放语法与掩码，取消/到期复用同一释放点。普通请求不导入XGrammar。接口机制参考[DeepInfer结构化输出](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/structure_output)，不引入其异步编译/触发/回滚层。
+结构化请求支持同步eager/Graph与reference/CUDA采样；流水、mixed、分块与ignore_eos组合在submit集中拒绝。Graph只捕获模型前向，每次重放覆盖输出；图外greedy、单请求、同K批量CUDA或逐行回退各应用掩码一次。真实负无穷候选的排序键大于越界填充键0，少于K时零概率尾部保持平坦。`_commit`对实际Token调用一次accept_token，接受停止Token后标记语法完整；达到上限则标记截断。`_retire`沿原sampler.release释放语法与掩码，取消/到期复用同一释放点。普通请求不导入XGrammar。接口机制参考[DeepInfer结构化输出](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/structure_output)，不引入其异步编译/触发/回滚层。
+
+`bench_structured_output`复用同一输入、Schema和请求随机流，配对eager-reference、graph-reference、graph-cuda；submit至所有请求安全退休计时，JSON校验在计时外。记录输出、Decode批次、Graph计数与回收，只对等工作量给出速度比。
 
 `check_model.py` 提供 CUDA/INT8 模型对照，`runner --mode check` 开启 HF 逐步对照。调度、分块、混合前向、Graph、流水和采样各有对应的 `check_*` 入口。
 

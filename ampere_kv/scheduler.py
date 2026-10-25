@@ -128,9 +128,8 @@ class Scheduler:
         if self.mixed and temperature != 0:
             raise ValueError("随机采样暂不支持mixed模式")
         if structured is not None:
-            if (self.decode_pipeline is not None or self.graphs is not None or self.mixed
-                    or self.prefill_chunk_size or ignore_eos or sampling_backend != "reference"):
-                raise ValueError("结构化请求仅支持整段Prefill、同步eager、reference采样及正常EOS")
+            if self.decode_pipeline is not None or self.mixed or self.prefill_chunk_size or ignore_eos:
+                raise ValueError("结构化请求仅支持整段Prefill、同步eager/Graph及正常EOS")
             if structured.vocab_size != self.model.config.vocab_size or set(structured.stop_token_ids) != self.eos_ids:
                 raise ValueError("编译语法的词表与停止Token必须匹配模型")
         request = Request(request_id, input_ids, max_new_tokens, need, ignore_eos, deadline)

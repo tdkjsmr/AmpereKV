@@ -56,7 +56,7 @@ python -m ampere_kv.runner --mode generate --cache paged --temperature 0.8 --top
 
 ### JSON Schema 约束输出
 
-可选依赖为 `xgrammar==0.1.18`（extra 名 `structured`）。在已有环境中安装该固定版本后，用 `python -m ampere_kv.check_structured_output` 检查 tokenizer 与掩码，添加 `--model` 运行模型演示。
+可选依赖为 `xgrammar==0.1.18`（extra 名 `structured`）。在已有环境中安装该固定版本后，用 `python -m ampere_kv.check_structured_output` 检查 tokenizer、掩码和CUDA采样，添加 `--model` 检查三条同步模型路径；`--path eager-reference|graph-reference|graph-cuda` 可指定一条。
 
 ```python
 from ampere_kv.runner import load_model_and_tokenizer, encode_prompt
@@ -75,7 +75,9 @@ while request.status != "finished":
 print(tokenizer.decode(request.output_ids, skip_special_tokens=True), request.stop_reason)
 ```
 
-编译结果可复用，每请求独占 matcher 与掩码。首 Token 起按 Schema 过滤，EOS 表示语法完整结束；输出上限提前到达时报告“结构化截断”，保留原文本。支持 BF16/V1、整段 Prefill、同步 eager 和 reference 采样，允许不同 Schema 与普通请求共存。结构化请求在提交时拒绝 Graph、流水、mixed、分块 Prefill、ignore_eos 与 CUDA 采样；普通请求保持原用法。不安装可选依赖也能运行普通请求。
+编译结果可复用，每请求独占 matcher 与掩码。首 Token 起按 Schema 过滤，EOS 表示语法完整结束；输出上限提前到达时报告“结构化截断”，保留原文本。支持 BF16/V1、整段 Prefill、同步 eager/Graph 和 reference/CUDA 采样，允许不同 Schema 与普通请求共存。使用 Graph 时在首次 submit 前调用 `scheduler.enable_graphs(256)`（容量须16对齐且覆盖请求历史）；CUDA采样由 submit 的 `sampling_backend="cuda"` 显式启用，沿用 B1/B4、K40/128 快路径与其他情况的参考回退。语法与选词在模型图外，每次重放重写 logits。结构化请求仍拒绝流水、mixed、分块 Prefill 与 ignore_eos；不安装可选依赖也能运行普通请求。
+
+小规模配对用 `python -m ampere_kv.bench_structured_output --output /仓库外目录/structured.json --run-id structured-01`，默认 B1/B4、每路径预热一次，按正序/逆序/正序各测一组。报告 eager-reference、graph-reference、graph-cuda 的提交至整批回收时间；编译、建池和捕获另列，只对输出数及Decode工作量相同的路径计算速度比。
 
 ## 阅读与测试
 

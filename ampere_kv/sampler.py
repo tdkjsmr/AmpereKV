@@ -104,6 +104,9 @@ def sample_batch(logits, requests, positions=None, out=None):
     k = states[0].top_k
     if len(states) in (1, 4) and k in (40, 128) and logits.shape[1] <= 524288 and all(
             s.backend == "cuda" and s.top_k == k and s.temperature > 0 for s in states):
+        for row, state in zip(logits, states):
+            if state.structured is not None:
+                state.structured.mask(row)
         temperatures = torch.cat([s.temperature_device for s in states])
         uniforms = torch.stack([s.uniforms[p] for s, p in zip(states, positions)])
         return cuda_sample(logits, temperatures, uniforms, k, out)
