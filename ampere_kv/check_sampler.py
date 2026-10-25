@@ -293,13 +293,14 @@ def check_cuda():
                         expected = [distribution(row, t.item(), -1)[1] for row, t in zip(values, temperatures)]
                         cdfs = [cumulative_probabilities(p) for p in expected]
                         reference_cdf = torch.stack(cdfs)
-                        edge = reference_cdf[:, k // 2]
+                        # B4的列切片步长为K，扩展输入要求连续[B]。
+                        edge = reference_cdf[:, k // 2].contiguous()
                         uniforms = [torch.zeros_like(edge), torch.full_like(edge, 1 - 2**-24),
                                     torch.nextafter(edge, torch.zeros_like(edge)), edge,
                                     torch.nextafter(edge, torch.ones_like(edge))]
                         out = torch.empty(batch, device="cuda", dtype=torch.long)
                         _, other = cuda_candidates(values, ids, temperatures, uniforms[0], out)
-                        other_edge = other[:, k // 2]
+                        other_edge = other[:, k // 2].contiguous()
                         uniforms += [other_edge, torch.nextafter(other_edge, torch.zeros_like(edge)),
                                      torch.nextafter(other_edge, torch.ones_like(edge)), (edge + other_edge) * 0.5]
                         for name, u in [("boundary", u) for u in uniforms] + [
