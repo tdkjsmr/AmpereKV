@@ -22,7 +22,7 @@ AmpereKV 是面向 Qwen3-8B、单张 RTX 3090（`sm_86`）的轻量文本推理�
 ```bash
 git clone https://github.com/tdkjsmr/AmpereKV.git
 cd AmpereKV
-git switch --detach v2.0.1  # 固定发布版本
+git switch --detach v2.1.0  # 固定发布版本
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip 'setuptools>=69' wheel
@@ -40,11 +40,9 @@ python -m ampere_kv.runner --mode generate --cache paged
 
 ### 异步流水与随机采样
 
-这两项位于 `codex/deepinfer-decode-handoff` 分支。完成上述环境准备后，切换源码：
+v2.1.0已包含异步流水与随机采样。完成上述环境准备后，可直接运行：
 
 ```bash
-git fetch origin codex/deepinfer-decode-handoff
-git switch --track origin/codex/deepinfer-decode-handoff  # 首次创建本地跟踪分支
 python -m ampere_kv.runner --mode generate --cache paged --temperature 0.8 --top-k 40 --seed 42
 ```
 
