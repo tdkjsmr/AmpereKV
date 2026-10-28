@@ -248,6 +248,7 @@ def main():
     parser.add_argument("--pool-requests", type=int, default=8)
     parser.add_argument("--max-batch", type=int, default=4)
     parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--graph-batches", type=int, nargs="+", help="显式捕获真实批量，例如1 2 3 4；默认沿用B1/B4")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     if (not math.isfinite(args.seconds) or args.seconds <= 0 or not math.isfinite(args.drain_seconds)
@@ -256,6 +257,9 @@ def main():
         parser.error("时长/重复/批量须为正，排空时长非负，池预算至少8请求，手动速率须为有限正数")
     if args.output.resolve().is_relative_to(root):
         parser.error("结果JSON须写入仓库外目录")
+    if args.graph_batches is not None and (not args.cuda_graph or any(
+            not 1 <= b <= min(args.max_batch, 4) for b in args.graph_batches)):
+        parser.error("--graph-batches须同时启用--cuda-graph，批量限1至min(max-batch,4)")
     if args.rate is not None:
         try:
             arrival_table(args.rate, args.seconds)
@@ -275,10 +279,19 @@ def main():
     with torch.inference_mode():
         started = time.perf_counter()
         scheduler = scheduler_type()(model, args.pool_requests * budget, max_batch=args.max_batch)
+        capture = None
         if args.cuda_graph:
-            scheduler.enable_graphs(width)
+            torch.cuda.synchronize()
+            before = (torch.cuda.memory_allocated(), torch.cuda.memory_reserved())
+            capture_started = time.perf_counter()
+            scheduler.enable_graphs(width, batches=args.graph_batches)
+            torch.cuda.synchronize()
+            capture = dict(wall_ms=(time.perf_counter() - capture_started) * 1000,
+                           allocated_delta_bytes=torch.cuda.memory_allocated() - before[0],
+                           reserved_delta_bytes=torch.cuda.memory_reserved() - before[1])
         torch.cuda.synchronize()
         initialization_ms = (time.perf_counter() - started) * 1000
+        print(f"[初始化] 总耗时={initialization_ms:.3f}ms，实际捕获={sorted(scheduler.graphs or {})}，捕获成本={capture}")
         warmup = calibration(scheduler, templates, 4, torch.cuda.synchronize)
         reference = calibration(scheduler, templates, 16, torch.cuda.synchronize)
         mu = reference["requests_per_s"]
@@ -300,6 +313,7 @@ def main():
                 mixed=False, pipeline=False, structured=False, cuda_graph=args.cuda_graph, max_batch=args.max_batch,
                 pool_requests=args.pool_requests, request_budget_blocks=budget, blocks_per_layer=scheduler.blocks_per_layer,
                 block_size=BLOCK_SIZE, graph_capacity_tokens=width if args.cuda_graph else None,
+                graph_batches=sorted(scheduler.graphs or {}),
                 max_planned_requests=256, burst_group_size=8,
                 arrival_seconds=args.seconds, max_drain_seconds=args.drain_seconds, repeats=args.repeats,
                 rates=rates, rate_source="manual" if args.rate is not None else "fixed_fractions_of_closed_loop_mu",
@@ -309,7 +323,7 @@ def main():
                 kv_observations="块池已分配编号与预留额度；物理KV预分配，不是torch allocated",
                 metric_scopes="TTFT/间隔包含已输出的部分请求，完成延迟/完成请求率仅正常完成",
                 timing="到达窗口起点至窗口结束及全部安全退休，含等待/空闲/排空；模型/输入/建池/捕获/预热在外"),
-            initialization_ms=initialization_ms, warmup=warmup, calibration=reference, scenes=[])
+            initialization_ms=initialization_ms, graph_capture=capture, warmup=warmup, calibration=reference, scenes=[])
         for name, events in tables.items():
             scene = dict(name=name, rate=rates[name], arrivals=events, arrival_table_sha256=digest(events), samples=[])
             result["scenes"].append(scene)

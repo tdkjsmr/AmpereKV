@@ -93,6 +93,8 @@ python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
 
 默认每场景到达60秒，之后最多排空120秒；`--scenarios`选择场景，`--seconds`/`--rate`调整窗口及手动速率，`--repeats`复用同一到达表。单场景超过256请求直接提示调整参数，KV池默认预留8个完整请求预算，`--max-batch`仅限制一次Decode成组大小。
 
+`--cuda-graph --graph-batches 1 2 3 4`显式增加同步B2/B3覆盖；省略集合仍捕获B1/B4。结果记录实际集合、捕获墙钟及allocated/reserved增量；API对应`enable_graphs(capacity, batches=(1, 2, 3, 4))`，异步流水仍限B1/B4。
+
 JSON分别记录计划到达、实际提交、准入及Token提交时间，单列驱动补交延迟与引擎等待，TTFT从计划到达计。窗口内与含排空吞吐分列，附实际批量/Graph、KV状态及回收；截止取消不计正常完成，原闭环入口保持不变。
 
 ## 阅读与测试

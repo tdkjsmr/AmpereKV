@@ -76,18 +76,21 @@ class Scheduler:
         eos = model.generation_config.eos_token_id
         self.eos_ids = {eos} if isinstance(eos, int) else set(eos or [])
 
-    def enable_graphs(self, max_tokens: int) -> None:
-        """首个请求提交前，在本调度器的物理 KV 池捕获固定 B=1/4 Decode 图。"""
+    def enable_graphs(self, max_tokens: int, *, batches: tuple[int, ...] | None = None) -> None:
+        """首次提交前捕获真实批量；省略集合时仍选择B1/B4。"""
         if self._submitted or self.graphs is not None or self.mixed:
             raise ValueError("Graph 只能在首次提交前启用，且不与混合轮同时使用")
         if (max_tokens <= 0 or max_tokens % PAGED_BLOCK_SIZE or self.block_size != PAGED_BLOCK_SIZE
                 or self.model.config.head_dim != 128 or not self.storages[0]._key.is_cuda
                 or self.storages[0]._key.dtype != torch.bfloat16):
             raise ValueError("Graph 仅支持 CUDA BF16 V1、128维、块16及16对齐的正容量")
-        from ampere_kv.graph_decode import capture_scheduler_graph
-        batches = (1, 4) if self.max_batch >= 4 else (1,)
+        batches = tuple(batches) if batches is not None else ((1, 4) if self.max_batch >= 4 else (1,))
+        if not batches or any(type(batch) is not int or not 1 <= batch <= min(self.max_batch, 4) for batch in batches):
+            raise ValueError("Graph批量集合须非空，且为1至min(max_batch,4)的整数")
+        batches = tuple(sorted(set(batches)))
         if self.blocks_per_layer < max(batches):
             raise ValueError("物理池不足以捕获所需批量")
+        from ampere_kv.graph_decode import capture_scheduler_graph
         graphs = {batch: capture_scheduler_graph(self.model, self.storages, batch, max_tokens)
                   for batch in batches}
         self.graphs = graphs
@@ -99,7 +102,8 @@ class Scheduler:
 
     def enable_pipeline(self, *, overlap=True):
         """返回显式advance/drain驱动；overlap=False为同步控制，不替换原step契约。"""
-        if self._submitted or self.graphs is None or self.mixed or self.max_batch not in (1, 4) or self.decode_pipeline:
+        if (self._submitted or self.graphs is None or self.mixed or self.max_batch not in (1, 4)
+                or any(batch not in (1, 4) for batch in self.graphs) or self.decode_pipeline):
             raise ValueError("流水须在首次提交前启用，仅支持已有Graph的BF16/V1 B1/B4，不能mixed")
         from ampere_kv.async_decode import DecodePipeline
         self.decode_pipeline = DecodePipeline(self, overlap=overlap)

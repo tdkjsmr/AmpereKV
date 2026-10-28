@@ -12,8 +12,8 @@ from ampere_kv.scheduler import FINISHED, Scheduler
 
 
 def make_state(model, lengths, steps):
-    if len(lengths) not in (1, 4) or min(lengths) < 1 or steps < 1:
-        raise ValueError("Graph 对照用例仅支持 B=1/4、非空历史和至少一步 Decode")
+    if not 1 <= len(lengths) <= 4 or min(lengths) < 1 or steps < 1:
+        raise ValueError("Graph 对照用例仅支持 B=1至4、非空历史和至少一步 Decode")
     width = max((length + steps + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE for length in lengths)
     blocks = sum((length + steps + PAGED_BLOCK_SIZE - 1) // PAGED_BLOCK_SIZE for length in lengths)
     storages = [PagedKVStorage(model.config.num_key_value_heads, model.config.head_dim,
@@ -154,12 +154,14 @@ def prompt(model, length, offset):
                         device="cuda").remainder(model.config.vocab_size)[None]
 
 
-def start_pair(model, lengths, limits, max_batch, max_tokens):
+def start_pair(model, lengths, limits, max_batch, max_tokens, *, batches=None):
     blocks = sum((length + limit + PAGED_BLOCK_SIZE) // PAGED_BLOCK_SIZE
                  for length, limit in zip(lengths, limits))
     eager = Scheduler(model, blocks, max_batch=max_batch)
     graph = Scheduler(model, blocks, max_batch=max_batch)
-    graph.enable_graphs(max_tokens)
+    graph.enable_graphs(max_tokens, batches=batches)
+    for field in ("tokens", "positions", "metadata_buffer", "logits"):
+        assert len({getattr(g, field).data_ptr() for g in graph.graphs.values()}) == len(graph.graphs)
     assert graph.reserved_blocks == 0 and all(s._pool.num_free_blocks == blocks for s in graph.storages)
     assert eager.graphs is None and eager.graph_calls == eager.graph_fallbacks == eager.graph_captures == 0
     inputs = [prompt(model, length, index * 97) for index, length in enumerate(lengths)]
@@ -221,9 +223,11 @@ def check_uploaded(graph, before, groups, addresses):
     return checks
 
 
-def drive(model, lengths, limits, max_batch, max_tokens, *, lifecycle=False):
+def drive(model, lengths, limits, max_batch, max_tokens, *, lifecycle=False, batches=None, boundary_check=False):
     eager, graph, references, requests, addresses, blocks = start_pair(
-        model, lengths, limits, max_batch, max_tokens)
+        model, lengths, limits, max_batch, max_tokens, batches=batches)
+    captured_batches = set(graph.graphs)
+    assert captured_batches == set(batches if batches is not None else ((1, 4) if max_batch >= 4 else (1,)))
     metadata_addresses = {batch: (captured.metadata_buffer.data_ptr(),
                                   [(starts.data_ptr(), table.data_ptr()) for starts, table in captured.metadata])
                           for batch, captured in graph.graphs.items()}
@@ -231,26 +235,37 @@ def drive(model, lengths, limits, max_batch, max_tokens, *, lifecycle=False):
     stopped = added = reused = new_hit = False
     freed = set()
     after_new = None
+    post_stop_batches, new_batches = set(), set()
     for _ in range(64):
         if all(request.status == FINISHED for request in requests):
             break
         before = {batch: captured.replays for batch, captured in graph.graphs.items()}
         before_calls = graph.graph_calls
-        running = list(graph.running)
+        before_fallbacks = graph.graph_fallbacks
+        # 停止发生在轮首，块表核对须使用去掉取消/到期请求后的真实Decode组。
+        now = time.monotonic()
+        running = [r for r in graph.running if not r.stop_reason and (r.deadline is None or r.deadline > now)]
         groups = [running[offset:offset + graph.max_batch]
                   for offset in range(0, len(running), graph.max_batch)]
-        starts = [request.caches[0].length for request in running]
+        hits = [group for group in groups if len(group) in graph.graphs
+                and all(r.caches[0].length < max_tokens for r in group)]
+        boundary.extend((max(r.caches[0].length for r in group), "Graph" if group in hits else "eager")
+                        for group in groups)
         _, graph_sizes = graph.step()
         _, eager_sizes = eager.step()
         assert graph_sizes == eager_sizes
+        assert graph.graph_calls - before_calls == len(hits)
+        assert graph.graph_fallbacks - before_fallbacks == len(groups) - len(hits)
+        assert {b: g.replays - before[b] for b, g in graph.graphs.items()} == {
+            b: sum(len(group) == b for group in hits) for b in captured_batches}
         sizes_seen.update(graph_sizes)
+        if stopped:
+            post_stop_batches.update(graph_sizes)
         compare(eager, graph, references, requests, addresses)
         uploads += check_uploaded(graph, before, groups, metadata_addresses)
         if added and requests[-1] in running and graph.graph_calls > before_calls:
             new_hit = True
-        if max_batch == 1 and running:
-            action = "Graph" if graph.graph_calls > before_calls else "eager"
-            boundary.append((starts[0], action))
+            new_batches.update(len(group) for group in hits if requests[-1] in group)
         if lifecycle and not stopped and graph.graphs[4].replays:
             freed = set(requests[0].caches[0]._table.block_ids) | set(requests[1].caches[0]._table.block_ids)
             eager.cancel(references[0])
@@ -274,18 +289,23 @@ def drive(model, lengths, limits, max_batch, max_tokens, *, lifecycle=False):
     assert eager.graph_calls == eager.graph_fallbacks == eager.graph_captures == 0
     if lifecycle:
         assert requests[0].stop_reason == "已取消" and requests[1].stop_reason == "已超时"
-        assert added and reused and new_hit and graph.graph_calls > after_new and graph.graph_captures == 2
-        print(f"[PASS] Graph后取消/到期、邻座序列与eager一致；新请求复用释放块并再次命中，捕获仍为{graph.graph_captures}")
-    elif max_batch == 1:
+        assert added and reused and new_hit and graph.graph_calls > after_new and graph.graph_captures == len(captured_batches)
+        if {2, 3} <= captured_batches:
+            assert {2, 3} <= post_stop_batches and 3 in new_batches
+        print(f"[PASS] Graph后取消/到期：后续子批={sorted(post_stop_batches)}，新请求复用块并命中={sorted(new_batches)}；"
+              f"邻座序列与eager一致，捕获仍为{graph.graph_captures}")
+    elif boundary_check:
         assert (max_tokens - 1, "Graph") in boundary and (max_tokens, "eager") in boundary
-        assert graph.graph_calls > 0 and graph.graph_fallbacks > 0 and graph.graph_captures == 1
-        print(f"[PASS] B1 容量边界：最后命中起点={max_tokens - 1}，下一步回退起点={max_tokens}；"
+        assert graph.graph_calls > 0 and graph.graph_fallbacks > 0 and graph.graph_captures == len(captured_batches)
+        print(f"[PASS] B{max_batch}容量边界：最后命中起点={max_tokens - 1}，下一步回退起点={max_tokens}；"
               f"命中={graph.graph_calls}，回退={graph.graph_fallbacks}，捕获={graph.graph_captures}")
     else:
         assert {1, 2, 3, 4} <= sizes_seen
-        assert graph.graphs[1].replays > 0 and graph.graphs[4].replays > 0
-        assert graph.graph_fallbacks > 0 and graph.graph_captures == 2
-        print(f"[PASS] B4 逐步准入/退场：子批={sorted(sizes_seen)}，B1/B4命中、B2/B3回退；"
+        assert all(g.replays > 0 for g in graph.graphs.values())
+        assert (graph.graph_fallbacks == 0) == (captured_batches == {1, 2, 3, 4})
+        assert graph.graph_captures == len(captured_batches)
+        replays = {b: g.replays for b, g in graph.graphs.items()}
+        print(f"[PASS] B4逐步准入/退场：子批={sorted(sizes_seen)}，重放={replays}；"
               f"命中={graph.graph_calls}，回退={graph.graph_fallbacks}，捕获={graph.graph_captures}")
     print(f"[PASS] 逐请求完整输出、停止原因、36层长度/地址/块隔离与归还一致；块表上传核对={uploads}")
 
@@ -303,12 +323,16 @@ def main():
         else:
             raise AssertionError("首次提交后或混合模式错误启用了 Graph")
     print("[PASS] 首次提交后与 mixed 模式拒绝启用 Graph；默认路径未捕获")
-    check_case(model, [15])
-    check_case(model, [15, 16, 63, 64])
-    drive(model, [16], [20], 1, 32)
-    drive(model, [17] * 4, [8] * 4, 4, 64)
+    for lengths in ([15], [15, 16], [15, 16, 63], [15, 16, 63, 64]):
+        check_case(model, lengths)
+    for batch in (1, 2, 3):
+        drive(model, [16] * batch, [20] * batch, batch, 32,
+              batches=tuple(range(1, batch + 1)), boundary_check=True)
+    drive(model, [17] * 4, [8] * 4, 4, 64, batches=(1, 4))
     drive(model, [17] * 4, [8] * 4, 4, 64, lifecycle=True)
-    print("[完成] 固定 B1/B4 Graph 调度检查通过")
+    drive(model, [17] * 4, [8] * 4, 4, 64, batches=(1, 2, 3, 4))
+    drive(model, [17] * 4, [8] * 4, 4, 64, lifecycle=True, batches=(1, 2, 3, 4))
+    print("[完成] B1至B4 Graph对照、真实批量覆盖、退出/取消/到期、容量回退与块复用通过")
 
 
 if __name__ == "__main__":
