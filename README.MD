@@ -82,6 +82,19 @@ print(tokenizer.decode(request.output_ids, skip_special_tokens=True), request.st
 
 小规模配对用 `python -m ampere_kv.bench_structured_output --output /仓库外目录/structured.json --run-id structured-01`，默认 B1/B4、每路径预热一次，按正序/逆序/正序各测一组。RTX 3090 上，Graph+CUDA采样相对同步eager-reference的整批中位耗时下降18.79%/8.76%；配置与原始样本见[同步结构化输出报告](docs/BENCHMARK.md#同步结构化输出6ea7014)。
 
+### 动态到达负载
+
+开发分支 `codex/dynamic-load` 提供单线程预定到达基准，使用4条512 Token输入模板，每请求固定32输出。先以4请求预热、16请求闭环校准得到参考速率mu，再固定低/稳定/高负载探测的0.25/0.75/1.25mu；突发按8请求成组，与稳定场景同请求总量及到达窗口。
+
+```bash
+python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
+  --output /absolute/path/arrivals.json --run-id arrivals-01 --cuda-graph
+```
+
+默认每场景到达60秒，之后最多排空120秒；`--scenarios`选择场景，`--seconds`/`--rate`调整窗口及手动速率，`--repeats`复用同一到达表。单场景超过256请求直接提示调整参数，KV池默认预留8个完整请求预算，`--max-batch`仅限制一次Decode成组大小。
+
+JSON分别记录计划到达、实际提交、准入及Token提交时间，单列驱动补交延迟与引擎等待，TTFT从计划到达计。窗口内与含排空吞吐分列，附实际批量/Graph、KV状态及回收；截止取消不计正常完成，原闭环入口保持不变。
+
 ## 阅读与测试
 
 执行主线：`runner.py`（模型前向）→ `scheduler.py`（调度）→ `paged_cache.py`（缓存）→ `graph_decode.py`（Graph）。`async_decode.py` 管理跨轮流水，`sampler.py` 管理请求级采样。
