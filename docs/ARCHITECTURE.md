@@ -29,60 +29,44 @@ AmpereKV 在单张 CUDA GPU 上运行 Qwen3-8B。线性层、Embedding、RMSNorm
 
 ## 调度与 Graph
 
-`scheduler.py` 管理 waiting、prefilling、running 和 finished 状态。每轮准入请求、批量 Decode，并在轮次起点处理取消和到期。单请求 runner 为各层单独创建缓存。
+`scheduler.py`按FIFO维护waiting、唯一prefilling槽位、running和finished。每轮先在轮首处理取消/到期，再Decode、回收、推进一个Prefill块；末块才选首Token并转入running。预留额度覆盖请求后续增长，不能用当前空闲块数代替。`_retire()`统一释放采样状态、KV和预算。
 
-首次 `submit()` 前调用 `Scheduler.enable_graphs(max_tokens)`，在共享 KV 池上捕获固定 B1/B4 的 BF16/V1 Decode Graph。其他批量或超容量使用 eager，Prefill 和资源回收沿用原流程。Graph 与混合前向分开启用。
+Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；开发分支可用`enable_graphs(max_tokens, batches=(1, 2, 3, 4))`增加真实B2/B3。容量须16对齐；其他批量或超容量回退eager。静态输入/输出和元数据由图持有，每步重写位置与各层块表；返回logits会被下一次重放覆盖。
+
+`prefill_chunk_size=0`保持整段，正值每轮推进一块。后续块使用`j ≤ history+i`偏移因果掩码；Prefill不进Graph。混合前向共用投影和MLP，Attention仍按请求独立，与Graph分开启用。配置与接口见[README](../README.MD)，取舍见[动态负载报告](BENCHMARK.md#动态到达负载与分块取舍)。
 
 ## 跨轮流水
 
-同步 `Scheduler.step()` 为默认路径。启用 Graph 后、首次提交前调用：
+同步`Scheduler.step()`为默认。首次提交前启用Graph，再调用`scheduler.enable_pipeline(overlap=True)`，之后通过`advance()`推进、`drain()`收尾；`overlap=False`作为设备接续的同步对照。
 
-```python
-pipeline = scheduler.enable_pipeline(overlap=True)
-```
-
-之后通过 `pipeline.advance()` 推进、`pipeline.drain()` 收尾。`overlap=False` 使用相同实现并在当轮等待提交，作为同步对照。有在途结果时统一由 pipeline 驱动。
-
-`async_decode.py` 为每个固定批量分配两个交替槽，保存设备 Token、pinned 元数据与输出，以及采样完成和输出就绪事件。计算流执行输入更新、Graph 和选词；拷贝流等待采样事件后取回 Token。下一轮输入直接使用前槽设备 Token。
+`async_decode.py`为B1/B4分配两个交替槽，持有设备Token、pinned元数据/输出和CUDA事件。计算流执行输入更新、Graph与选词，拷贝流等待采样事件再取回Token；下一轮输入直接使用前槽设备Token。
 
 ```text
-首次推进：发射 j → 返回
-后续推进：发射 j+1 → 等 j 的输出就绪 → CPU 提交 j → 返回
-收尾排空：等待最后一轮 → 提交有效结果 → 回收资源
+首次：发射j → 返回
+后续：发射j+1 → 等j的输出就绪 → CPU提交j → 返回
+排空：等待最后一轮 → 提交有效结果 → 回收
 ```
 
-推进内部最多有两轮未提交，接口返回时最多一轮。槽位保留至对应事件完成，设备 Token 消费后再覆盖。`cache.length` 表示已登记执行长度；已产生首 Token 的请求，其 CPU 已提交有效 KV 长度为 `输入长度 + 输出数量 - 1`。
+内部最多两轮在途、返回时最多一轮。槽位持有至事件完成，旧设备Token消费后才能覆盖。`cache.length`表示已登记执行长度，CPU已提交有效长度为`P+len(output_ids)-1`。B2/B3、等待准入、身份变化或容量边界先排空，再走同步调度。EOS/取消/到期丢弃对应在途结果，设备引用结束后退休；停止只在轮首生效，Prefill保持同步。
 
-请求身份、容量和生成上限满足条件时执行前瞻。B2/B3、等待准入、身份变化或容量边界先排空，再回退同步调度。EOS、取消或到期后丢弃该请求的在途结果，其他请求照常提交；设备引用结束后统一退休。Prefill 保持同步。
-
-设计参考 DeepInfer 的设备 Token 接续和 current-forward / previous-post 执行方式，来源与时间线见[单步流水报告](BENCHMARK.md#di-02受限单步流水消融f5d5c33)。
+设计参考DeepInfer的设备Token接续及current-forward / previous-post方式，来源与时间线见[单步流水报告](BENCHMARK.md#di-02受限单步流水消融f5d5c33)。
 
 ## 请求级采样
 
-`sampler.py` 的 `RequestSampler` 保存 temperature、top-k、seed 和随机数缓冲。参数在请求提交时校验：
+`RequestSampler`在提交时校验temperature/top-k/seed。每请求私有CPU Generator产生N个FP32 uniform并上传，占`4N`字节，退休时释放。位置0为Prefill首Token；同步按已提交输出数索引，流水按`flight.targets-1`索引，前瞻丢弃不推进共享随机游标。
 
-- temperature 为 0 时使用 argmax；随机模式使用 FP32 正规正数温度。
-- 每请求独立 CPU `torch.Generator`，按输出上限 N 生成 FP32 uniform 并上传，GPU 缓冲占 `4N` 字节。
-- 缺省 seed 来自系统熵；请求安全退休时释放缓冲。
+选词在模型图外进行：分数降序、同分Token ID升序，选足top-k后稳定softmax；已有FP32概率用FP64累计，除以实际总量后转回FP32 CDF，零概率尾部平坦，末端为1。固定环境、后端、参数和位置可复现；不同后端可在CDF移动分界处选中不同候选。
 
-位置 0 对应 Prefill 首 Token。同步路径按已提交输出数索引，流水发射按 `flight.targets - 1` 索引。随机数按位置读取，前瞻、丢弃和回退沿用这一位置约定。
+默认`reference`使用稳定排序。显式`cuda`支持同K的B1/B4、K40/128、FP32/BF16和V≤524288，其他组合回退参考。CUDA将大词表分段缩减为小候选，再融合温度、softmax、CDF和选词；全greedy使用argmax。CUDA与参考共用请求随机流，临时组批/分配在图外、当前流执行。
 
-GPU 选词在模型 Graph 外进行：BF16/FP32 logits（含语法过滤的负无穷项）转 FP32，按分数降序、同分 Token ID 升序排列，保留 top-k 后计算稳定 softmax，再用逆 CDF 选词。两后端都用 FP64 累计已有 FP32 概率，除以该累计的实际总量后转回 FP32；零概率尾部保持平坦，末端为 1。结果留在设备槽中供下一轮读取。
+来源：DeepInfer的[请求参数](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/sampling_params.py)、[采样层](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py)、[候选缩减/融合划分](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler_utils.py)，以及[DeepSelect的大词表小K场景](https://github.com/deepseek-ai/DeepSelect/tree/bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18)。请求随机流、逆CDF和CUDA内核由本项目实现。
 
-固定环境和采样后端下，相同 logits、参数、seed 和位置可复现采样。不同后端可能在累计概率（CDF）分界附近选中不同候选。设计参考 DeepInfer 的[请求参数](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/sampling_params.py)与[采样层](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py)；本项目独立实现请求随机流与逆 CDF 选词。
+检查保留候选ID/分数精确对照，概率rtol=2e-6、atol=1e-7，CDF独立FP64及两侧绝对误差上限1e-6。各自选词须符合各自CDF；跨后端差异只接受uniform落在实际移动分界区间内，不修改生产随机数。模型首次分叉诊断在计时外。
 
-`sampling_backend="reference"` 保留稳定排序参考；显式 `cuda` 对同 K 的 B1/B4、K40/128 使用 `csrc/sampling.cu`。每2048个分数由256线程处理：线程内排序8个键，全块反复取最大值保留K项，再按各段有序队首归并。键组合FP32有序位与反向ID，同分取小ID，正负零统一，越界尾项不参与候选。随后一个warp融合温度、softmax、CDF与选词；FP32概率输出保持原义，选词的累计值按其实际总量归一化。其余情况回参考，全greedy仍用批量argmax。
+## 结构化输出与检查入口
 
-CUDA后端复用请求uniform及逻辑位置，缓存设备温度；组批和临时分配在模型Graph外、当前CUDA流执行，结果写回原设备槽。算法划分参考 DeepInfer [`process_sampling`](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler_utils.py) 的候选缩减/融合阶段及 [DeepSelect](https://github.com/deepseek-ai/DeepSelect/tree/bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18) 的大词表小K场景；实现独立编写，不依赖它们的运行库。候选ID/分数精确对齐，概率沿用rtol=2e-6、atol=1e-7；CDF对独立FP64参考及两侧之间的绝对误差上限为1e-6。各自选词须精确符合各自CDF，跨后端差异只接受0到1之间的均匀随机数落在实际移动分界区间内的情况，不向生产随机数添加偏移。模型只诊断首次分叉的相同输入，诊断不计入配对性能。
+`structured_output.py`通过可选XGrammar 0.1.18公开API编译Schema；编译结果可复用，每请求独占matcher与CPU/GPU bitmask。真实tokenizer和模型词表共同定义合法编号，补齐编号被排除；图外选词前将非法logits设为负无穷，零合法项直接报错。
 
-## 检查与测量
+支持同步eager/Graph与reference/CUDA采样，提交时拒绝流水、mixed、分块及ignore_eos。`_commit`对实际Token调用一次accept_token，EOS标记完整、生成上限标记截断；`_retire`释放matcher及掩码。普通请求不导入XGrammar。接口参考[DeepInfer结构化输出](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/structure_output)。
 
-`structured_output.py` 使用可选XGrammar 0.1.18公开API：调用方用真实tokenizer、模型logits词表大小和模型停止Token构造编译器；CompiledSchema可复用，RequestSampler独占每请求的matcher与CPU/GPU bitmask。CPU生成合法掩码并排除补齐编号，GPU在argmax/Top-K前将非法分数设为负无穷。空合法集合直接报错，不解除约束。
-
-结构化请求支持同步eager/Graph与reference/CUDA采样；流水、mixed、分块与ignore_eos组合在submit集中拒绝。Graph只捕获模型前向，每次重放覆盖输出；图外greedy、单请求、同K批量CUDA或逐行回退各应用掩码一次。真实负无穷候选的排序键大于越界填充键0，少于K时零概率尾部保持平坦。`_commit`对实际Token调用一次accept_token，接受停止Token后标记语法完整；达到上限则标记截断。`_retire`沿原sampler.release释放语法与掩码，取消/到期复用同一释放点。普通请求不导入XGrammar。接口机制参考[DeepInfer结构化输出](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/structure_output)，不引入其异步编译/触发/回滚层。
-
-`bench_structured_output`复用同一输入、Schema和请求随机流，配对eager-reference、graph-reference、graph-cuda；submit至所有请求安全退休计时，JSON校验在计时外。记录输出、Decode批次、Graph计数与回收，只对等工作量给出速度比。
-
-`check_model.py` 提供 CUDA/INT8 模型对照，`runner --mode check` 开启 HF 逐步对照。调度、分块、混合前向、Graph、流水和采样各有对应的 `check_*` 入口。
-
-`bench_external.py` 测量离线整批完成时间，`bench_workload.py` 测量闭环负载与流水消融，`paged_decode.py` 提供算子数值检查及调用基准。
+`runner --mode check`为HF逐步对照，`check_model`覆盖CUDA/INT8模型；调度、分块、Graph、流水、采样和语法各有`check_*`入口。`bench_external`测离线整批，`bench_workload`测闭环与流水，`bench_arrivals`测预定到达，`profile_arrivals`定位阶段，`paged_decode --benchmark`测算子调用。命令与测试表见[README](../README.MD)，配置和数据集中在[性能报告](BENCHMARK.md)。

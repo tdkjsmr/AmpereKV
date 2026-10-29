@@ -7,13 +7,11 @@ class ContiguousKVCache:
     """固定容量、只允许尾部追加的推理缓存，不支持扩容或任意位置覆盖。"""
 
     def __init__(self, num_kv_heads: int, head_dim: int, capacity: int, device="cpu"):
-        # 当前批大小固定为 1；头数、每头维度和容量由调用方明确给出。
         if num_kv_heads <= 0 or head_dim <= 0 or capacity <= 0:
             raise ValueError("KV 头数、每头维度和容量必须为正数")
         self.capacity = capacity
         self.length = 0
         shape = (1, num_kv_heads, capacity, head_dim)
-        # empty 不初始化数据：只有已经写入的前缀才有效，未写入区域绝不能使用。
         self._key = torch.empty(shape, dtype=torch.bfloat16, device=device)
         self._value = torch.empty(shape, dtype=torch.bfloat16, device=device)
 
@@ -31,7 +29,6 @@ class ContiguousKVCache:
     def get(self) -> tuple[torch.Tensor, torch.Tensor]:
         """返回有效前缀视图；调用方应只读，修改返回值也会修改缓存。"""
 
-        # 不返回未初始化的尾部，不额外复制历史数据。
         # 多头情况下，容量大于有效长度时，这个视图可能不是 contiguous 张量。
         return self._key[:, :, :self.length, :], self._value[:, :, :self.length, :]
 
@@ -39,26 +36,14 @@ class ContiguousKVCache:
 def prefill_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache,
 ) -> torch.Tensor:
-    """追加整段或分块 Prefill，返回本段输入位置的因果 Attention 输出。
-
-    BF16 缓存输出 BF16；INT8 分页缓存反量化后用 FP32 计算并输出，仅作参考。
-    不支持填充输入；追加后若计算失败，不自动回滚缓存。
-    """
+    """追加整段或分块Prefill并计算因果Attention；INT8读回用FP32参考。"""
     return _cached_attention(query, key, value, cache, is_causal=True)
 
 
 def decode_attention(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, cache,
 ) -> torch.Tensor:
-    """追加当前单 Token 的 BF16 K/V，返回 [1, Query 头数, 1, 每头维度]。
-
-    BF16 缓存输出 BF16；INT8 分页缓存的反量化参考输出 FP32。
-
-    接受提供 length、append、get 的连续或分页缓存；无需继承公共基类。
-    调用前必须已有历史，调用方不要提前追加当前 K/V；重复调用会重复追加。
-    追加后若计算失败，不自动回滚缓存，不能盲目重试。
-    这是推理参考计算，不包含 QKV 投影、位置编码、头合并或输出投影。
-    """
+    """追加单Token并计算Attention；调用前须已有历史，失败后不重试已写入缓存。"""
     if cache.length == 0:
         raise ValueError("Decode 前必须已有历史 K/V")
     return _cached_attention(query, key, value, cache, is_causal=False)

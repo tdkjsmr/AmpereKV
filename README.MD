@@ -6,12 +6,22 @@ AmpereKV 是面向 Qwen3-8B、单张 RTX 3090（`sm_86`）的轻量文本推理�
 
 - **推理与调度**：BF16 Prefill、贪心生成、连续/分页 KV、连续批处理、分块 Prefill、混合前向，以及请求取消和到期回收。
 - **CUDA Decode**：直接读取分页 KV，支持等头数和 GQA；调度器默认使用 BF16/V1，单请求 BF16 生成默认使用 SDPA。
-- **CUDA Graph**：固定 B1/B4 的 BF16/V1 Decode，其他批量或超容量回退 eager。
+- **CUDA Graph**：BF16/V1 Decode默认捕获B1/B4；开发分支可显式增加B2/B3，其他批量或超容量回退eager。
 - **INT8 KV**：K 每 32 维一组 scale，V 每 Token、每 KV 头一个 scale；计入 scale 后，同容量 KV 存储比 BF16 减少约 48%。
 - **异步流水**：设备端 Token 接续、双缓冲和单步前瞻，提供同步与重叠两种执行方式。
 - **请求级采样**：temperature、top-k 和独立 seed，兼容同步与异步 Decode。
 
-分页块大小固定为 16 Token，每个请求独占已分配块。随机采样与异步流水使用 BF16/V1、非 mixed 路径；Graph 用于固定 B1/B4 Decode。项目采用离线文本推理接口，每次提交建立独立请求。
+分页块大小为16 Token，每请求独占已分配块。支持组合集中如下：
+
+| 入口 | 支持范围 |
+|---|---|
+| 单请求生成 | BF16连续/分页KV；INT8使用分页CUDA Decode，权重仍为BF16 |
+| 同步调度 | BF16/V1，整段或分块Prefill；Graph默认B1/B4，开发分支可显式B1至B4 |
+| 混合前向 | BF16、greedy；与Graph分开启用 |
+| 异步流水 | BF16/V1、B1/B4 Graph；普通请求，可用随机采样 |
+| JSON Schema | BF16/V1、整段Prefill、同步eager/Graph、正常EOS；reference/CUDA采样 |
+
+Graph容量须16对齐并覆盖历史；首次提交前捕获。模型前向在图内，选词与语法过滤在图外。
 
 ## 安装与运行
 
@@ -40,7 +50,7 @@ python -m ampere_kv.runner --mode generate --cache paged
 
 ### 异步流水与随机采样
 
-v2.1.0已包含异步流水与随机采样。完成上述环境准备后，可直接运行：
+完成环境准备后，可运行请求级随机采样：
 
 ```bash
 python -m ampere_kv.runner --mode generate --cache paged --temperature 0.8 --top-k 40 --seed 42
@@ -48,7 +58,7 @@ python -m ampere_kv.runner --mode generate --cache paged --temperature 0.8 --top
 
 默认 `temperature=0` 为贪心生成。`top_k=-1` 使用全词表，其余取值为 `1..vocab_size`；seed 为 `0..2^32-1`，省略时自动生成并由 runner 打印。调度器使用 `submit(..., temperature=0.8, top_k=40, seed=42)`。固定环境和采样后端下，相同 logits、参数、seed 和输出位置可复现；不同后端可能在累计概率（CDF）分界附近选中不同候选。
 
-默认采样后端为 `reference`。重新 `make build` 后，可在生成命令添加 `--sampling-backend cuda`，或在 `submit()` 传入 `sampling_backend="cuda"`，选择分段 Top-K 与小候选融合采样。快路径支持 B1/B4、K40/128、FP32/BF16、V≤524288；异构 K 或混合 greedy 走参考。用 `python -m ampere_kv.check_sampler --sampling-backend cuda --model` 检查，`python -m ampere_kv.bench_sampler` 运行配对微基准。
+默认采样后端为 `reference`。在生成命令添加 `--sampling-backend cuda`，或在 `submit()` 传入 `sampling_backend="cuda"`，选择分段 Top-K 与小候选融合采样。快路径支持 B1/B4、K40/128、FP32/BF16、V≤524288；异构 K 或混合 greedy 走参考。用 `python -m ampere_kv.check_sampler --sampling-backend cuda --model` 检查，`python -m ampere_kv.bench_sampler` 运行配对微基准。
 
 异步基准用 `bench_workload --mode steady --cuda-graph --pipeline a|b|c|abc` 选择同步、设备接续同步、跨轮重叠或三路配对。完整命令见[单步流水报告](docs/BENCHMARK.md#di-02受限单步流水消融f5d5c33)。
 
@@ -78,29 +88,28 @@ with torch.inference_mode():
 print(tokenizer.decode(request.output_ids, skip_special_tokens=True), request.stop_reason)
 ```
 
-编译结果可复用，每请求独占 matcher 与掩码。首 Token 起按 Schema 过滤，EOS 表示语法完整结束；输出上限提前到达时报告“结构化截断”，保留原文本。支持 BF16/V1、整段 Prefill、同步 eager/Graph 和 reference/CUDA 采样，允许不同 Schema 与普通请求共存。使用 Graph 时在首次 submit 前调用 `scheduler.enable_graphs(256)`（容量须16对齐且覆盖请求历史）；CUDA采样由 submit 的 `sampling_backend="cuda"` 显式启用，沿用 B1/B4、K40/128 快路径与其他情况的参考回退。语法与选词在模型图外，每次重放重写 logits。结构化请求仍拒绝流水、mixed、分块 Prefill 与 ignore_eos；不安装可选依赖也能运行普通请求。
+编译结果可复用，每请求独占matcher与掩码，允许不同Schema和普通请求共存。从首Token起过滤，EOS表示语法完整结束；达到输出上限时报告“结构化截断”。普通请求无需安装XGrammar。
 
-小规模配对用 `python -m ampere_kv.bench_structured_output --output /仓库外目录/structured.json --run-id structured-01`，默认 B1/B4、每路径预热一次，按正序/逆序/正序各测一组。RTX 3090 上，Graph+CUDA采样相对同步eager-reference的整批中位耗时下降18.79%/8.76%；配置与原始样本见[同步结构化输出报告](docs/BENCHMARK.md#同步结构化输出6ea7014)。
+配对入口为 `python -m ampere_kv.bench_structured_output --output /absolute/path/structured.json --run-id structured-01`；配置、原始样本与结果见[同步结构化输出报告](docs/BENCHMARK.md#同步结构化输出6ea7014)。
 
 ### 动态到达负载
 
-开发分支 `codex/dynamic-load` 提供单线程预定到达基准，使用4条512 Token输入模板，每请求固定32输出。先以4请求预热、16请求闭环校准得到参考速率mu，再固定低/稳定/高负载探测的0.25/0.75/1.25mu；突发按8请求成组，与稳定场景同请求总量及到达窗口。
+以下入口位于开发分支`codex/dynamic-load`，测量版本为`e6325dc`；安装步骤中的固定发布版`v2.1.0`不含这些新增入口。已有环境可用以下命令切到测量版本：
 
 ```bash
+git fetch origin codex/dynamic-load
+git switch --detach e6325dc3b934c57afeb25b281b2866ba31391055
 python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
-  --output /absolute/path/arrivals.json --run-id arrivals-01 --cuda-graph
+  --output /absolute/path/arrivals.json --run-id arrivals-01 \
+  --cuda-graph --graph-batches 1 2 3 4 --prefill-chunk-size 0 \
+  --scenarios steady burst --rate 2.128913764807336
 ```
 
-默认每场景到达60秒，之后最多排空120秒；`--scenarios`选择场景，`--seconds`/`--rate`调整窗口及手动速率，`--repeats`复用同一到达表。单场景超过256请求直接提示调整参数，KV池默认预留8个完整请求预算，`--max-batch`仅限制一次Decode成组大小。
+输入为四条512 Token模板，每请求固定32输出。默认4请求预热、16请求闭环校准，显式`--rate`固定正式到达率；窗口60秒、排空上限120秒。`--scenarios`、`--seconds`、`--repeats`选择场景、时长和重复；每场最多256请求，KV池预算8请求，`--max-batch`限制一次Decode组大小。
 
-`--cuda-graph --graph-batches 1 2 3 4`显式增加同步B2/B3覆盖；省略集合仍捕获B1/B4。结果记录实际集合、捕获墙钟及allocated/reserved增量；API对应`enable_graphs(capacity, batches=(1, 2, 3, 4))`，异步流水仍限B1/B4。
+`--prefill-chunk-size 256`选择分块，默认0为整段。Graph省略集合时仍捕获B1/B4，显式集合对应`enable_graphs(capacity, batches=(1, 2, 3, 4))`。组合检查运行`python -m ampere_kv.check_chunked`。延迟、吞吐、排空口径和配对取舍见[动态到达报告](docs/BENCHMARK.md#动态到达负载与分块取舍)。
 
-`--prefill-chunk-size 256`复用分块Prefill，每轮Decode后推进最多256 Token；默认0仍为整段。Prefill不进Graph，JSON记录实际块长与执行方式。组合检查运行`python -m ampere_kv.check_chunked`，同块长eager/Graph严格对照与整段/分块数值观察分开。
-
-JSON分别记录计划到达、实际提交、准入及Token提交时间，单列驱动补交延迟与引擎等待，TTFT从计划到达计。窗口内与含排空吞吐分列，附实际批量/Graph、KV状态及回收；截止取消不计正常完成，原闭环入口保持不变。
-
-短诊断用 `python -m ampere_kv.profile_arrivals --input /absolute/path/inputs.json --output /absolute/path/profile.json --run-id profile-01`：固定速率、8秒steady，保存轮次/Decode/Prefill/commit的CPU区间及NVTX标记，列出最长5个和普通3个Token间隔。
-`--no-record`关闭阶段标记作对照，`--capture`仅在预热后的目标运行调用CUDA采集控制；`--mode insert`执行共同起点、第4轮插入512 Token Prefill的AB/BA局部间隔对照。GPU执行和等待关系通过Nsight时间线核对。
+时间线入口为`python -m ampere_kv.profile_arrivals --input /absolute/path/inputs.json --output /absolute/path/profile.json --run-id profile-01`：默认8秒steady；`--no-record`关闭标记，`--capture`采集预热后的目标批次，`--mode insert`运行固定轮次插入对照。
 
 ## 阅读与测试
 

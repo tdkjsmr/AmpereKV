@@ -1,6 +1,6 @@
-# 固定负载的离线对比
+# 固定负载性能与执行取舍
 
-本报告记录 RTX 3090 上的离线整批完成时间，覆盖外部引擎对比、Graph、元数据上传与异步流水消融。各组列出实测提交、配置、原始样本和结果。
+本报告记录RTX3090上的外部整批对比、Graph与流水消融、动态到达延迟取舍。整批完成时间、动态请求延迟与Nsight诊断分别列出配置和统计。
 
 历史实验的提交哈希标识对应测量版本；归档源码与输入的获取要求见文末复现说明。
 
@@ -67,7 +67,7 @@
 
 同顺序 E/G 配对的整批中位耗时下降：B=1 为 `23.367%`、`22.977%`，B=4 为 `14.854%`、`14.896%`。G/V 完成时间比为 B=1 `1.2349×`、`1.2284×`，B=4 `1.3435×`、`1.3477×`。反向顺序同模式中位数的最大变化为 B=1 的 E `0.901%`、G `0.396%`、V `0.134%`，B=4 的 E `0.362%`、G `0.312%`、V `<0.001%`，均低于 `5%` 环境排查线。
 
-12 份私有 JSON 的实际 Run ID、提交 `7e6bf9b`、输入文件 SHA256 `3262a3904a3c8dfa6d85b8cd63bdc64647783a0d5cd4604496c5166b6362dd80` 已核对；所选输入 SHA256 为 B=1 `e2d1ac38a473406a5e9a26f46a65ba54941fa9eaba11d09d76bf550b1942e36c`、B=4 `22e0ff4cf8fd7422ecd69d068d732d196bd46fb9fc278e3a4ee1df40faf1291a`。B=1 的 E/G/V 输出摘要均为 `a3f96ba20a0fd92cb9583ccd032739ef160f04a48ed10b357754f9eca33c9a59`，B=4 均为 `0418c37d29436ea551dafe674c64daca429fe48bd5a4cd0dbec97a08d121d059`；另对 E1/G1、E2/G2 和两次 G 的逐请求完整序列作直接比较，B1/B4 均一致。AmpereKV 每个正式样本计时外核对与同进程预热完整序列一致、输出数与块归还。
+12 份结果 JSON 的实际 Run ID、提交 `7e6bf9b`、输入文件 SHA256 `3262a3904a3c8dfa6d85b8cd63bdc64647783a0d5cd4604496c5166b6362dd80` 已核对；所选输入 SHA256 为 B=1 `e2d1ac38a473406a5e9a26f46a65ba54941fa9eaba11d09d76bf550b1942e36c`、B=4 `22e0ff4cf8fd7422ecd69d068d732d196bd46fb9fc278e3a4ee1df40faf1291a`。B=1 的 E/G/V 输出摘要均为 `a3f96ba20a0fd92cb9583ccd032739ef160f04a48ed10b357754f9eca33c9a59`，B=4 均为 `0418c37d29436ea551dafe674c64daca429fe48bd5a4cd0dbec97a08d121d059`；另对 E1/G1、E2/G2 和两次 G 的逐请求完整序列作直接比较，B1/B4 均一致。AmpereKV 每个正式样本计时外核对与同进程预热完整序列一致、输出数与块归还。
 
 G 使用 BF16/V1、块16、整段 Prefill、`mixed=False`，捕获容量 544 Token、块表宽34；E 保留原 eager。B=1 每样本 Graph 31 次、回退0、捕获总数1；B=4 每样本 Graph 30 次（B4 28、B1 2）、回退4（B2/B3）、捕获总数2，正式重复未重捕获。捕获初始化墙钟：B1 两个 G Run 为 `500.339/516.043 ms`，B4 为 `726.895/722.910 ms`；对应 `allocated` 状态差为 `+17,382,400/+27,192,320` 字节，`reserved` 状态差为 `+46,137,344/+90,177,536` 字节。初始化耗时及显存状态差单独记录。B4 单批 Nsight 时间线中 30 次 `cudaGraphLaunch` 与 28 次 B4、2 次 B1 Graph 范围对应。
 
@@ -230,10 +230,38 @@ python -m ampere_kv.bench_structured_output --batches 1 4 \
   --output /absolute/path/structured.json --run-id structured-repro-01
 ```
 
+## 动态到达负载与分块取舍
+
+固定RTX3090、Qwen3-8B Revision `b968826d9c46dd6066d109eabc6255188de91218`、Torch2.5.1+cu124/CUDA12.4/transformers4.51.0，BF16/V1、greedy、每请求512输入/32输出、忽略EOS。四条输入模板沿用上文B4指纹；速率固定为`2.128913764807336`请求/s，steady按间隔到达、burst每8请求成组，各60秒128请求，最多排空120秒。max_batch=4、每层280块、Graph容量544，mixed/流水/结构化关闭。每进程4请求预热、16请求闭环参考在外；显式速率不随参考mu变化。三对按AB/BA/AB运行，每对先算B/A变化，再取变化的中位数；TTFT与完成延迟从计划到达计，Token间隔按commit入口就绪时间计，窗口与含排空吞吐分列。
+
+| 对照/提交 | 负载 | Token间隔中位变化 | 间隔P95变化 | TTFT中位变化 | 完成延迟中位变化 |
+|---|---|---:|---:|---:|---:|
+| B1/B4→B1至B4 Graph，`e76d721` | steady | −25.16% | −0.28% | −6.40% | −16.77% |
+| B1/B4→B1至B4 Graph，`e76d721` | burst | +0.03% | +0.004% | −1.93% | −1.55% |
+| 整段→256分块，两侧B1至B4 Graph，`e6325dc` | steady | +2.52% | −24.02% | +42.34% | +15.03% |
+| 整段→256分块，两侧B1至B4 Graph，`e6325dc` | burst | +0.21% | −21.23% | +42.74% | +16.59% |
+
+Run ID为`load02-pair{1,2,3}-{a,b}01`和`load04-pair{1,2,3}-{a,b}01`，各进程含steady/burst一次；A/B分别对应表中箭头两端。两组分别核对输入/完整到达表、逐模板输出摘要、工作量和回收。LOAD02的steady Graph调用覆盖从2.14%—5.71%升至100%，捕获增加17.75MiB allocated、44MiB reserved，墙钟配对增量中位380.124ms。LOAD04全部场景Graph100%命中、零回退，12场1536请求全部完成；steady窗口输出吞吐变化中位−0.345%，排空多81.5—86.8ms，burst窗口吞吐不变。固定到达率下的窗口吞吐不等于最大持续处理能力。
+
+时间线定位版本`e1ff14e`，Run ID为`load03-steady-on01`、`load03-steady-profile01`、`load03-insert01`：无工具记录558个间隔中，33个跨新请求Prefill的长间隔约162—165ms；代表例为Prefill 142.038ms后再执行约25.123ms Decode。Prefill可见GPU工作并集134.342ms；其中宿主同步与GPU工作重叠，不能把等待另加到阶段耗时。Graph内部未展开。固定轮次插入AB/BA将旧请求局部间隔增加138.193/138.826ms，与插入Prefill 137.902/138.428ms相符。
+
+保留整段Prefill默认，256分块作为显式实验。分块把长停顿拆短，但每场3968个间隔中，超过100ms的数量steady为253→506、burst为448→896；该界线仅描述频次。burst准入等待中位还增加40.34%。后续块仍需执行完整层栈并读回历史，这与早期小Chunk变慢的负结果相容；读回改进前后的历史观察不与本表混算，也不据此推断更小Chunk会更快。当前两种负载都没有支持全局开启分块的综合收益。
+
+开发分支的当前复现入口如下；用自备四条512 Token输入时记录新指纹和Run ID，复现原始配对则使用对应归档输入与提交：
+
+```bash
+python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
+  --output /absolute/path/arrivals.json --run-id arrivals-repro-01 \
+  --cuda-graph --graph-batches 1 2 3 4 --prefill-chunk-size 0 \
+  --scenarios steady burst --seconds 60 --rate 2.128913764807336
+```
+
+将块长改为256运行另一独立进程；B1/B4对照显式传`--graph-batches 1 4`。阶段定位沿用`profile_arrivals --capture`及`--mode insert`；记录与Profiler采集用于解释机制，正式配对不启用它们。
+
 ## 复现说明
 
 整批测量入口为 `bench_external`，算子基准为 `paged_decode --benchmark`，流水消融入口和命令见上节。元数据合并上传版本完整标识为 `0ac0d950f31720ce47fa99a834bd98e2e33b5096`。
 
 - 各组数据对应各自的源码、配置与输入，配对比较在组内进行。部分历史源码和原始输入保存在独立归档中；使用自备输入时记录新的 Run ID、提交和结果。
-- 本报告使用离线整批计时。Nsight 单独采集，用于分析执行机制；初始化耗时和显存状态差单独列出。vLLM 的后端、Graph 和 Chunk 信息来自启动日志。
+- 整批计时、动态到达统计和Nsight采集分开；初始化耗时与显存状态差单独列出。vLLM的实际后端、Graph和Chunk来自启动日志。
 - 原始输入与采集文件保留在私有归档。公开采集文件前需清除环境变量等敏感信息。

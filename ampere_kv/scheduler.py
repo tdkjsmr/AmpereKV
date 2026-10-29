@@ -13,20 +13,15 @@ WAITING, PREFILLING, RUNNING, FINISHED = "waiting", "prefilling", "running", "fi
 
 
 class Request:
-    """一个请求的输入、输出与逐层缓存；Prefill 未结束时不进入 Decode 集合。
-
-    `caches[0].length`是已登记执行长度；同步路径从`output_ids`取下个输入，流水可领先提交。
-    采样状态在submit时绑定请求，输出位置不是KV长度；EOS与上限仍只写`stop_reason`。
-    """
+    """请求输入、输出和逐层缓存；流水的已登记KV长度可领先CPU提交。"""
 
     def __init__(self, request_id: str, input_ids: torch.Tensor, max_new_tokens: int, budget_blocks: int,
                  ignore_eos: bool = False, deadline: float | None = None):
         self.request_id = request_id
-        self.input_ids = input_ids  # [1, P] CUDA int64；提交后不再修改。
+        self.input_ids = input_ids
         self.max_new_tokens = max_new_tokens
-        # 调度器级预留额度，与"已分配块数""有效长度"是三回事，见 Scheduler.submit 的注释。
         self.budget_blocks = budget_blocks
-        self.ignore_eos = ignore_eos  # 只用于固定工作量的基线；正常生成仍遇 EOS 停止。
+        self.ignore_eos = ignore_eos
         # 绝对截止时刻取自调用方同一进程的 time.monotonic()；None 表示不限，到期只在轮次起点被看到。
         self.deadline = deadline
         self.status = WAITING
@@ -37,27 +32,19 @@ class Request:
 
 
 class Scheduler:
-    """各层共享一个 PagedKVStorage，请求只持有自己的块表；单线程按 FIFO 推进。
-
-    共享的是空闲块池，不是已经分配给某个请求的块：分配出的物理块仍由所属请求独占，所以不
-    需要引用计数、锁或所有权移交。释放只发生在 `_retire` 一处。
-    """
+    """单线程FIFO；每层共享块池，请求独占已分配块，统一由_retire释放。"""
 
     def __init__(self, model, blocks_per_layer: int, *, block_size: int = PAGED_BLOCK_SIZE,
                  device="cuda", max_batch: int = 1, prefill_chunk_size: int = 0, mixed: bool = False):
-        # 参数边界只查一次；0 保留整段 Prefill，正常前向不重复检查自身产生的状态。
         if max_batch < 1 or prefill_chunk_size < 0:
             raise ValueError("max_batch 必须为正，prefill_chunk_size 不能为负")
         config = model.config
         self.model = model
         self.block_size = block_size
         self.device = device
-        # max_batch=1 使用单请求路径；>1 将一组请求的当前 Token 合成一次前向。
         self.max_batch = max_batch
         self.prefill_chunk_size = prefill_chunk_size
-        # mixed 默认关闭：已验证的分离路径不被默默替换，实验侧显式选择才走混合前向。
         self.mixed = mixed
-        # 两个计数器只服务一件事：报告开关到底生效了几轮、回退了几轮，防止"没混合也报收益"。
         self.mixed_rounds = 0
         self.fallback_rounds = 0
         self.graphs = None
@@ -65,13 +52,11 @@ class Scheduler:
         self.decode_pipeline = None
         self._submitted = False
         self.blocks_per_layer = blocks_per_layer
-        # 每层一份共享物理张量与块池；请求接入时只新建块表，不再分配或复制张量。
         self.storages = [PagedKVStorage(config.num_key_value_heads, config.head_dim, blocks_per_layer,
                                         block_size, device=device) for _ in model.model.layers]
         self.waiting: list[Request] = []
         self.running: list[Request] = []
         self.prefilling: Request | None = None
-        # 各层需求相同，所以一个计数就是每层已预留的块数之和。
         self.reserved_blocks = 0
         eos = model.generation_config.eos_token_id
         self.eos_ids = {eos} if isinstance(eos, int) else set(eos or [])
@@ -113,10 +98,7 @@ class Scheduler:
                ignore_eos: bool = False, deadline: float | None = None, *,
                temperature: float = 0.0, top_k: int = -1, seed: int | None = None,
                sampling_backend: str = "reference", structured=None) -> Request:
-        """边界校验集中在提交时；内部模型调用不再重复检查自己产出的形状与设备。
-
-        `deadline` 是同一进程 `time.monotonic()` 上的绝对时刻，None 表示不设限、走原有路径。
-        """
+        """提交单条CUDA请求；deadline为同进程time.monotonic绝对时刻，None不限。"""
         if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
             raise ValueError("当前只支持单条非空 Token 序列")
         if input_ids.dtype != torch.long or not input_ids.is_cuda:
@@ -146,11 +128,7 @@ class Scheduler:
         return request
 
     def cancel(self, request: Request) -> None:
-        """标记取消；同步路径在下轮起点回收，流水路径先排空在途引用；不打断GPU工作。
-
-        只接受本调度器 `submit()` 返回的 Request——这是调用契约，不为此建全局注册表或逐轮归属
-        扫描。已完成对象重复调用无作用；已有停止原因不被覆盖，所以取消优先于同一轮的到期判断。
-        """
+        """标记本调度器的请求取消；轮首生效，流水先排空设备引用，已有停止原因优先。"""
         if request.status != FINISHED:
             request.stop_reason = request.stop_reason or "已取消"
 
@@ -179,7 +157,6 @@ class Scheduler:
         else:
             input_ids = request.input_ids.new_tensor([[request.output_ids[-1]]])
         positions = torch.arange(start, start + input_ids.shape[1], device=input_ids.device).unsqueeze(0)
-        # Prefill 始终走 SDPA；Decode 用默认 V1 内核，与单请求生成路径完全相同。
         logits = model_forward(self.model, input_ids, positions, request.caches,
                                is_prefill=prefill, cuda_decode=not prefill, output_logits=output_logits)
         # 位置按已提交输出计数：Prefill末块为0，中间块不消耗随机数。
@@ -193,7 +170,6 @@ class Scheduler:
         # 位置是每个请求各自的绝对位置，不共享——批量不等于对齐历史长度。
         positions = torch.tensor([[request.caches[0].length] for request in group],
                                  dtype=torch.long, device=self.device)
-        # 转置成"每层一组请求缓存"：同一层的 B 个缓存指向同一份共享物理存储与块池。
         layer_caches = [[request.caches[layer] for request in group] for layer in range(len(self.storages))]
         logits = (model_forward_batched(self.model, tokens, positions, layer_caches) if graph is None
                   else graph.step(layer_caches, tokens, positions))
@@ -214,11 +190,7 @@ class Scheduler:
         return graph
 
     def _decode_round(self) -> list[int]:
-        """按 max_batch 分块推进活动请求，返回每一批实际处理的请求数。
-
-        批量大小在真正调用前向的地方记账，不从轮末的活动队列长度反推——同一轮末尾还会接入
-        新请求，用队列长度推算会把没参与这次批量 Decode 的请求也算进批里。
-        """
+        """按max_batch推进活动请求；批量计数取实际前向组，不取轮末队列长度。"""
         sizes: list[int] = []
         if self.max_batch == 1:
             for request in self.running:
@@ -236,17 +208,11 @@ class Scheduler:
         return sizes
 
     def _mixed_round(self) -> int:
-        """混合轮：一组 Decode Token 与一个 Prefill 块合成一次逐 Token 前向，返回本批 Decode 数。
-
-        调用方已保证有 pending 且活动数不超过 `max_batch`。块长与"是不是最后一块"在前向之前
-        就定死：中间块不选词，末块才产出新请求的首 Token，所以新请求不会在同一轮又被 Decode。
-        本轮需要的 Token 一次取回——Decode 的就绪时间因此晚于整次混合计算，这是实测必须体现的成本。
-        """
+        """合并一组Decode与一个Prefill块；中间块不选词，末块只产生新请求首Token。"""
         group = self.running
         pending = self.prefilling
         decode_ids = torch.tensor([[request.output_ids[-1]] for request in group],
                                   dtype=torch.long, device=self.device)
-        # 各请求的绝对位置来自自己的缓存长度，与打包进同一次前向的块 Token 无关。
         decode_positions = torch.tensor([[request.caches[0].length] for request in group],
                                         dtype=torch.long, device=self.device)
         layer_caches = [[request.caches[layer] for request in group] for layer in range(len(self.storages))]
@@ -279,7 +245,7 @@ class Scheduler:
         self.prefilling = request
 
     def _stop(self, request: Request, now: float) -> bool:
-        """本轮要不要停下它；停就顺手在唯一释放点退休，避免"标记了却还占着额度"的中间态。"""
+        """保留已有停止原因；到期请求从统一释放点退休。"""
         expired = request.deadline is not None and request.deadline <= now
         if not (request.stop_reason or expired):
             return False
@@ -288,10 +254,7 @@ class Scheduler:
         return True
 
     def _stop_round(self, now: float) -> list[Request]:
-        """用本轮起点读到的那一个时刻处理取消与到期；被停下的请求本轮不再启动新前向。
-
-        退休会把状态改成 FINISHED，所以第二次筛表就是"去掉本轮已停的"，不需要另建集合。
-        """
+        """按同一个轮首时刻处理等待、Prefill和Decode请求的取消与到期。"""
         stopped = [request for request in self.waiting if self._stop(request, now)]
         self.waiting = [request for request in self.waiting if request.status != FINISHED]
         stopped += [request for request in self.running if self._stop(request, now)]
@@ -302,26 +265,17 @@ class Scheduler:
         return stopped
 
     def _retire(self, request: Request) -> None:
-        """唯一的释放点：归还全部层的块、按退休前状态扣回额度，并把请求移出活动集合。
-
-        WAITING 从未计入 `reserved_blocks`，所以扣减要看状态而不是"KV 长度是否大于 0"——
-        整段 Prefill 的请求在第一次前向之前长度同样是 0，用长度判断会把它误扣一次。
-        """
+        """统一释放采样状态与KV；WAITING未计预算，其他状态按预留额度扣回。"""
         request.sampler.release()  # 流水仅在设备引用排空后退休，也在这里释放随机缓冲。
         for cache in request.caches:
             cache.release()
-        request.caches.clear()  # 丢弃块表引用，请求结束后不可能再被误当成活动请求。
+        request.caches.clear()
         if request.status != WAITING:
             self.reserved_blocks -= request.budget_blocks
         request.status = FINISHED
 
     def step(self) -> tuple[list[Request], list[int]]:
-        """一次调度轮次：合作式停止检查 → Decode（开关打开时可与一个 Prefill 块混合）→ 回收 → Prefill 推进。
-
-        取消与到期只在轮次起点生效：不打断已经发出的 GPU 工作，也不加 `cuda.synchronize` 去
-        模拟硬实时，所以轮内到期的请求可能多拿到本轮 Token——这是明示边界。返回的完成请求
-        （本轮被停下的加上正常结束的）每轮只交回一次，调度器自己不留历史。
-        """
+        """轮首停止检查→Decode→回收→推进一个Prefill块；返回本轮完成请求与实际批量。"""
         if self.decode_pipeline is not None and self.decode_pipeline.pending is not None:
             raise RuntimeError("有在途Decode；请先调用流水drain，不可混用step推进")
         finished = self._stop_round(time.monotonic())
@@ -335,7 +289,7 @@ class Scheduler:
             sizes = [self._mixed_round()]
         else:
             if self.mixed and self.prefilling is not None and self.running:
-                self.fallback_rounds += 1  # 活动数超过单批上限时，退回分离前向。
+                self.fallback_rounds += 1
             sizes = self._decode_round()
         for request in [r for r in self.running if r.stop_reason]:
             self.running.remove(request)
@@ -360,7 +314,6 @@ class Scheduler:
 
 
 if __name__ == "__main__":
-    # 保留旧命令；验收用例不再混在调度器实现中。
     from ampere_kv.check_scheduler import main
 
     main()
