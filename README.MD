@@ -97,6 +97,9 @@ python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
 
 JSON分别记录计划到达、实际提交、准入及Token提交时间，单列驱动补交延迟与引擎等待，TTFT从计划到达计。窗口内与含排空吞吐分列，附实际批量/Graph、KV状态及回收；截止取消不计正常完成，原闭环入口保持不变。
 
+短诊断用 `python -m ampere_kv.profile_arrivals --input /absolute/path/inputs.json --output /absolute/path/profile.json --run-id profile-01`：固定速率、8秒steady，保存轮次/Decode/Prefill/commit的CPU区间及NVTX标记，列出最长5个和普通3个Token间隔。
+`--no-record`关闭阶段标记作对照，`--capture`仅在预热后的目标运行调用CUDA采集控制；`--mode insert`执行共同起点、第4轮插入512 Token Prefill的AB/BA局部间隔对照。GPU执行和等待关系通过Nsight时间线核对。
+
 ## 阅读与测试
 
 执行主线：`runner.py`（模型前向）→ `scheduler.py`（调度）→ `paged_cache.py`（缓存）→ `graph_decode.py`（Graph）。`async_decode.py` 管理跨轮流水，`sampler.py` 管理请求级采样。
