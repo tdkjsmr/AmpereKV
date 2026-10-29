@@ -1,6 +1,7 @@
 """固定 Chunk 验收：偏移掩码、批量读回等价、真实模型对照、交错调度与合作式取消/到期。"""
 
 import time
+from unittest.mock import patch
 
 import torch
 
@@ -131,6 +132,111 @@ def check_interleaved(model, prompt, expected, chunk=128):
     print("[PASS] 分块期间 Decode 持续推进、未提前选词、交错序列与独立一致，全部块归还")
 
 
+def check_graph_chunked(model, prompt):
+    """同块长、同组批严格对照；真实重放与分块生命周期分别核对。"""
+    from ampere_kv import scheduler as implementation
+    from ampere_kv.check_graph_scheduler import check_equal, compare
+
+    capacity = sum(_budgets([prompt[:, :17]] * 3 + [prompt], (8, 10, 12, 6)))
+    eager = Scheduler(model, capacity, max_batch=4, prefill_chunk_size=256)
+    graph = Scheduler(model, capacity, max_batch=4, prefill_chunk_size=256)
+    graph.enable_graphs(544, batches=(1, 2, 3, 4))
+    addresses = {name: [(s._key.data_ptr(), s._value.data_ptr()) for s in owner.storages]
+                 for name, owner in (("eager", eager), ("graph", graph))}
+    original_forward, original_sample = implementation.model_forward, implementation.sample_batch
+
+    def step_logits(owner):
+        logits, retired = [], []
+        original_retire = owner._retire
+
+        def forward(*args, **kwargs):
+            result = original_forward(*args, **kwargs)
+            if result is not None:
+                logits.append(result.clone())
+            return result
+
+        def sample(values, group):
+            logits.append(values.clone())
+            return original_sample(values, group)
+
+        def retire(request):
+            length = (256 if request.stop_reason == "已取消" else
+                      request.input_ids.shape[1] + len(request.output_ids) - 1)
+            assert all(cache.length == length for cache in request.caches)
+            retired.append((request.request_id, [(cache.length, cache.get()) for cache in request.caches]))
+            original_retire(request)
+
+        # 只在测试侧截取选词前logits；不改调度路径，也不保留Graph复用缓冲的视图。
+        with (patch.object(implementation, "model_forward", forward),
+              patch.object(implementation, "sample_batch", sample), patch.object(owner, "_retire", retire)):
+            finished, sizes = owner.step()
+        return logits, [r.request_id for r in finished], sizes, retired
+
+    for length, cancel in ((512, False), (257, False), (512, True)):
+        references, requests = [], []
+
+        def advance():
+            actual, stopped, sizes, retired = step_logits(graph)
+            expected, ref_stopped, ref_sizes, ref_retired = step_logits(eager)
+            assert (stopped, sizes) == (ref_stopped, ref_sizes)
+            assert len(actual) == len(expected)
+            for index, (got, want) in enumerate(zip(actual, expected)):
+                check_equal(got, want, f"Chunk256 长度{length} 前向{index} logits")
+            for (name, layers), (ref_name, ref_layers) in zip(retired, ref_retired):
+                assert name == ref_name and len(layers) == len(ref_layers) == len(graph.storages)
+                for (size, values), (ref_size, ref_values) in zip(layers, ref_layers):
+                    assert size == ref_size
+                    for got, want in zip(values, ref_values):
+                        check_equal(got, want, f"{name} 退休前KV")
+            compare(eager, graph, references, requests, addresses)
+            for ref, request in zip(references, requests):
+                for layer, (cache, other) in enumerate(zip(request.caches, ref.caches)):
+                    blocks = cache._table.block_ids
+                    assert len(blocks) == (cache.length + 15) // 16
+                    assert all(0 <= block < capacity for block in blocks)
+                    for got, want in zip(cache.get(), other.get()):
+                        check_equal(got, want, f"{request.request_id} 第{layer}层KV")
+
+        def submit(name, ids, limit):
+            references.append(eager.submit(name, ids, limit, ignore_eos=True))
+            requests.append(graph.submit(name, ids, limit, ignore_eos=True))
+
+        for index, limit in enumerate((8, 10, 12)):
+            submit(f"short{index}", prompt[:, :17], limit)
+            advance()
+        submit("long", prompt[:, :length], 6)
+        old_counts = [len(r.output_ids) for r in requests[:-1]]
+        advance()
+        long = requests[-1]
+        assert graph.prefilling is long and long.status == PREFILLING and not long.output_ids
+        assert all(cache.length == 256 for cache in long.caches)
+        assert [len(r.output_ids) for r in requests[:-1]] == [n + 1 for n in old_counts]
+        if cancel:
+            eager.cancel(references[-1])
+            graph.cancel(long)
+        advance()
+        if cancel:
+            assert long.status == FINISHED and long.stop_reason == "已取消" and not long.output_ids
+        else:
+            assert long.status == RUNNING and len(long.output_ids) == 1
+            assert all(cache.length == length for cache in long.caches)
+            assert [len(r.output_ids) for r in requests[:-1]] == [n + 2 for n in old_counts]
+        for _ in range(16):
+            if all(r.status == FINISHED for r in requests):
+                break
+            advance()
+        assert all(r.status == FINISHED for r in requests)
+        completed = requests[:-1] if cancel else requests
+        assert all(len(r.output_ids) == r.max_new_tokens and r.stop_reason == "达到生成上限" for r in completed)
+        assert eager.reserved_blocks == graph.reserved_blocks == 0
+        assert all(s._pool.num_free_blocks == capacity for s in eager.storages + graph.storages)
+        print(f"[PASS] Chunk256+Graph 输入={length}，中途取消={cancel}：同组批logits/KV严格一致，"
+              "中间块不选词、邻座持续Decode、退出与回收通过")
+    assert graph.graph_fallbacks == 0 and graph.graph_captures == 4
+    assert all(g.replays > 0 for g in graph.graphs.values())
+    print(f"[PASS] 分块组合真实Graph重放={ {b: g.replays for b, g in graph.graphs.items()} }")
+
+
 def check_stop(model, long_prompt, short_prompt, chunk=64):
     """合作式取消与到期：三个活动容器各停一次，原因可区分，邻座序列与块归还都不受影响。
 
@@ -214,6 +320,10 @@ def main():
     check_interleaved(model, prompt, expected)
     print("[配置] 合作式停止用例：长请求 257 Token 按 Chunk=64 分块，短请求单独一条作对照")
     check_stop(model, prompt, ids)
+    long_prompt = ids.repeat(1, (512 + ids.shape[1] - 1) // ids.shape[1])[:, :512]
+    print("[配置] Chunk=256；512输入分两块，257输入含单Token尾块；Graph显式B1至B4")
+    check_model(model, long_prompt[:, :257], chunk=256)
+    check_graph_chunked(model, long_prompt)
     print("[完成] 固定 Chunk、交错调度与合作式取消/到期检查通过")
 
 

@@ -247,14 +247,16 @@ def main():
     parser.add_argument("--drain-seconds", type=float, default=120)
     parser.add_argument("--pool-requests", type=int, default=8)
     parser.add_argument("--max-batch", type=int, default=4)
+    parser.add_argument("--prefill-chunk-size", type=int, default=0, help="每轮Prefill块长；0为整段")
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--graph-batches", type=int, nargs="+", help="显式捕获真实批量，例如1 2 3 4；默认沿用B1/B4")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     if (not math.isfinite(args.seconds) or args.seconds <= 0 or not math.isfinite(args.drain_seconds)
             or args.drain_seconds < 0 or args.repeats < 1 or args.pool_requests < 8 or args.max_batch < 1
+            or args.prefill_chunk_size < 0
             or (args.rate is not None and (not math.isfinite(args.rate) or args.rate <= 0))):
-        parser.error("时长/重复/批量须为正，排空时长非负，池预算至少8请求，手动速率须为有限正数")
+        parser.error("时长/重复/批量须为正，排空时长和Prefill块长非负，池预算至少8请求，手动速率须为有限正数")
     if args.output.resolve().is_relative_to(root):
         parser.error("结果JSON须写入仓库外目录")
     if args.graph_batches is not None and (not args.cuda_graph or any(
@@ -278,7 +280,8 @@ def main():
     width = math.ceil((INPUT_TOKENS + OUTPUT_TOKENS) / BLOCK_SIZE) * BLOCK_SIZE
     with torch.inference_mode():
         started = time.perf_counter()
-        scheduler = scheduler_type()(model, args.pool_requests * budget, max_batch=args.max_batch)
+        scheduler = scheduler_type()(model, args.pool_requests * budget, max_batch=args.max_batch,
+                                     prefill_chunk_size=args.prefill_chunk_size)
         capture = None
         if args.cuda_graph:
             torch.cuda.synchronize()
@@ -292,6 +295,7 @@ def main():
         torch.cuda.synchronize()
         initialization_ms = (time.perf_counter() - started) * 1000
         print(f"[初始化] 总耗时={initialization_ms:.3f}ms，实际捕获={sorted(scheduler.graphs or {})}，捕获成本={capture}")
+        print(f"[Prefill] 块长={scheduler.prefill_chunk_size}（0为整段），分离执行，Prefill不进Graph")
         warmup = calibration(scheduler, templates, 4, torch.cuda.synchronize)
         reference = calibration(scheduler, templates, 16, torch.cuda.synchronize)
         mu = reference["requests_per_s"]
@@ -309,7 +313,9 @@ def main():
                              transformers=version("transformers")), model=dict(id=MODEL_ID, revision=MODEL_REVISION),
             input_file_sha256=file_hash, input_ids_sha256=input_hash,
             config=dict(input_tokens=INPUT_TOKENS, output_tokens=OUTPUT_TOKENS, ignore_eos=True, greedy=True,
-                weights_dtype="bf16", kv_dtype="bf16", decode_kernel="v1", prefill="whole_sdpa",
+                weights_dtype="bf16", kv_dtype="bf16", decode_kernel="v1",
+                prefill="chunked_sdpa" if scheduler.prefill_chunk_size else "whole_sdpa",
+                prefill_chunk_size=scheduler.prefill_chunk_size,
                 mixed=False, pipeline=False, structured=False, cuda_graph=args.cuda_graph, max_batch=args.max_batch,
                 pool_requests=args.pool_requests, request_budget_blocks=budget, blocks_per_layer=scheduler.blocks_per_layer,
                 block_size=BLOCK_SIZE, graph_capacity_tokens=width if args.cuda_graph else None,

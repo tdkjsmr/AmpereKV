@@ -95,6 +95,8 @@ python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
 
 `--cuda-graph --graph-batches 1 2 3 4`显式增加同步B2/B3覆盖；省略集合仍捕获B1/B4。结果记录实际集合、捕获墙钟及allocated/reserved增量；API对应`enable_graphs(capacity, batches=(1, 2, 3, 4))`，异步流水仍限B1/B4。
 
+`--prefill-chunk-size 256`复用分块Prefill，每轮Decode后推进最多256 Token；默认0仍为整段。Prefill不进Graph，JSON记录实际块长与执行方式。组合检查运行`python -m ampere_kv.check_chunked`，同块长eager/Graph严格对照与整段/分块数值观察分开。
+
 JSON分别记录计划到达、实际提交、准入及Token提交时间，单列驱动补交延迟与引擎等待，TTFT从计划到达计。窗口内与含排空吞吐分列，附实际批量/Graph、KV状态及回收；截止取消不计正常完成，原闭环入口保持不变。
 
 短诊断用 `python -m ampere_kv.profile_arrivals --input /absolute/path/inputs.json --output /absolute/path/profile.json --run-id profile-01`：固定速率、8秒steady，保存轮次/Decode/Prefill/commit的CPU区间及NVTX标记，列出最长5个和普通3个Token间隔。
