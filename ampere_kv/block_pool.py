@@ -82,6 +82,16 @@ class BlockTable:
         logical_block, offset = divmod(token_position, self._block_size)
         return self._block_ids[logical_block], offset
 
+    def truncate(self, length: int) -> None:
+        """保留有效前缀，归还完整尾块；末块无效字节由后续追加覆盖。"""
+        if type(length) is not int or not 0 <= length <= self._length:
+            raise ValueError("截断长度须为0至当前长度的整数")
+        required = (length + self._block_size - 1) // self._block_size
+        for block_id in self._block_ids[required:]:
+            self._pool.free(block_id)
+        del self._block_ids[required:]
+        self._length = length
+
     def release(self) -> None:
         """请求结束后归还全部块并重置长度；空表重复调用无操作，可重新使用。"""
         for block_id in self._block_ids:

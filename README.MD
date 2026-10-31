@@ -113,6 +113,8 @@ python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
 
 ## 阅读与测试
 
+投机解码实验位于`codex/speculative-decode`：固定Qwen3-8B目标和[Qwen3-0.6B草稿版本](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca)，共用目标分词输入，B1/BF16/greedy、同步eager，K仅2/4。`python -m ampere_kv.check_speculative_decode`运行CPU小用例，加`--model`检查两模型、验证位置和完整序列；`python -m ampere_kv.speculative_decode --draft-tokens 2 --prompt hi`运行实验生成。两个固定版本须先缓存到本地；该入口独立于调度器，当前只验证正确性与工作量。
+
 执行主线：`runner.py`（模型前向）→ `scheduler.py`（调度）→ `paged_cache.py`（缓存）→ `graph_decode.py`（Graph）。`async_decode.py` 管理跨轮流水，`sampler.py` 管理请求级采样。
 
 通过 `python -m ampere_kv.<模块名>` 运行检查：

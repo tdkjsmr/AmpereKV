@@ -134,6 +134,10 @@ class PagedKVCache:
         """归还请求占用的块；保留物理张量，不清零旧数据，不释放底层显存。"""
         self._table.release()
 
+    def truncate(self, length: int) -> None:
+        """截断逻辑尾部并归还完整尾块，保留有效K/V及存储地址。"""
+        self._table.truncate(length)
+
 
 def main() -> None:
     """检查分组 K 的物理布局与读回；CPU 执行，不调用 CUDA 或模型。"""

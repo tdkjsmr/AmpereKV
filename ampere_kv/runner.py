@@ -24,10 +24,10 @@ def encode_prompt(tokenizer, text: str) -> torch.Tensor:
     return tokenizer(formatted, add_special_tokens=False, return_tensors="pt")["input_ids"].to("cuda")
 
 
-def load_model_and_tokenizer():
-    """加载固定版本 Qwen3-8B 与分词器；单请求生成与多请求调度共用这一份加载逻辑。"""
+def load_model_and_tokenizer(model_id=MODEL_ID, revision=MODEL_REVISION, *, tokenizer=None):
+    """加载指定固定版本；默认Qwen3-8B，模型独立持有RoPE频率。"""
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, revision=MODEL_REVISION, torch_dtype=torch.bfloat16,
+        model_id, revision=revision, torch_dtype=torch.bfloat16,
         attn_implementation="sdpa", local_files_only=True,
     ).to("cuda")
     model.eval()
@@ -37,7 +37,8 @@ def load_model_and_tokenizer():
     exponent = torch.arange(0, dim, 2, dtype=torch.int64).float() / dim
     inv_freq = (1.0 / (model.config.rope_theta ** exponent)).to(model.model.embed_tokens.weight.device)
     model.register_buffer("_ampere_inv_freq", inv_freq, persistent=False)
-    return model, AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION, local_files_only=True)
+    return model, tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
+        model_id, revision=revision, local_files_only=True)
 
 
 def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -226,8 +227,8 @@ def model_forward_batched(model, token_ids: torch.Tensor, positions: torch.Tenso
 
 @torch.no_grad()
 def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, cuda_decode: bool = False,
-                  v3: bool = False, output_logits: bool = True):
-    """使用HF权重执行自建前向；中间Prefill块只更新KV，末块才返回最后位置logits。"""
+                  v3: bool = False, output_logits: bool = True, all_logits: bool = False):
+    """自建前向；默认返回末位置，all_logits显式返回本次所有输入位置的logits。"""
     if is_prefill and caches[0].length and caches[0]._key.dtype == torch.int8:
         raise ValueError("分块 Prefill 当前只支持 BF16 KV")
     layers = model.model.layers
@@ -238,14 +239,15 @@ def model_forward(model, input_ids, position_ids, caches, *, is_prefill: bool, c
             hidden_states, layer, position_ids, cache, model.config, inv_freq,
             is_prefill=is_prefill, cuda_decode=cuda_decode, v3=v3,
         )
-    return final_logits(model, hidden_states) if output_logits else None
+    return final_logits(model, hidden_states, all_positions=all_logits) if output_logits else None
 
 
-def final_logits(model, hidden_states):
-    """共用末尾归一化和LM Head，只返回最后位置的logits，不读写缓存。"""
+def final_logits(model, hidden_states, *, all_positions=False):
+    """末尾归一化和LM Head；默认只返回末位置，不读写缓存。"""
     norm = model.model.norm
     normalized = rms_norm(hidden_states, norm.weight, norm.variance_epsilon)
-    return torch.nn.functional.linear(normalized[:, -1:, :], model.lm_head.weight, model.lm_head.bias)
+    return torch.nn.functional.linear(normalized if all_positions else normalized[:, -1:, :],
+                                      model.lm_head.weight, model.lm_head.bias)
 
 
 @torch.inference_mode()
