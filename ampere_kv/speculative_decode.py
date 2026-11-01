@@ -66,7 +66,7 @@ def select_prefix(proposals, predictions, remaining, stops, ignore_eos=False):
 
 @torch.inference_mode()
 def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_tokens=64,
-                         ignore_eos=False, observer=None):
+                         ignore_eos=False, observer=None, diagnostic=None):
     """轮首两套KV均不含最后一个已输出Token；observer仅供正确性检查读取。"""
     if draft_tokens not in (2, 4) or not 1 <= max_new_tokens <= 64:
         raise ValueError("草稿长度仅支持2/4，输出上限须为1至64")
@@ -78,11 +78,24 @@ def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_to
     stops = eos_ids(target)
     rounds, proposed, accepted, draft_forwards = [], 0, 0, 1
     try:
+        if diagnostic is not None:
+            diagnostic.start("allocate")
         target_caches = make_caches(target, input_ids.shape[1] + max_new_tokens)
         draft_caches = make_caches(draft, input_ids.shape[1] + max_new_tokens)
+        if diagnostic is not None:
+            diagnostic.end()
+            diagnostic.start("target_prefill", gpu=True)
         first_logits = forward_tokens(target, input_ids, target_caches)
+        if diagnostic is not None:
+            diagnostic.end()
+            diagnostic.start("draft_prefill", gpu=True)
         forward_tokens(draft, input_ids, draft_caches)
+        if diagnostic is not None:
+            diagnostic.end()
+            diagnostic.start("first_selection")
         outputs = [first_logits[0, -1].argmax().item()]
+        if diagnostic is not None:
+            diagnostic.end()
         if observer is not None:
             observer(dict(prefill=True, output_start=0, committed=outputs.copy(), length=input_ids.shape[1]),
                      target_caches, draft_caches, first_logits)
@@ -92,13 +105,21 @@ def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_to
             count = min(draft_tokens, remaining - 1)
             pending, proposals = outputs[-1], []
             token = pending
+            if diagnostic is not None:
+                diagnostic.start("drafting", gpu=True)
             for _ in range(count):
                 logits = forward_tokens(draft, input_ids.new_tensor([[token]]), draft_caches)
                 token = logits[0, -1].argmax().item()
                 proposals.append(token)
+            if diagnostic is not None:
+                diagnostic.end()
+                diagnostic.start("verification", gpu=True)
             round_input = [pending, *proposals]
             logits = forward_tokens(target, input_ids.new_tensor([round_input]), target_caches, all_logits=True)
             predictions = logits[0].argmax(-1).tolist()
+            if diagnostic is not None:
+                diagnostic.end()
+                diagnostic.start("tail_state")
             committed, kept, matched = select_prefix(proposals, predictions, remaining, stops, ignore_eos)
             length = old_length + len(committed)
             for cache in target_caches:
@@ -107,8 +128,16 @@ def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_to
                 cache.truncate(min(length, cache.length))
             # 全接受时草稿尚未输入最后一个候选；补算真实KV，不能只增加逻辑长度。
             missing = round_input[draft_caches[0].length - old_length:length - old_length]
+            if diagnostic is not None:
+                diagnostic.end()
             if missing:
+                if diagnostic is not None:
+                    diagnostic.start("repair", gpu=True)
                 forward_tokens(draft, input_ids.new_tensor([missing]), draft_caches)
+                if diagnostic is not None:
+                    diagnostic.end()
+            if diagnostic is not None:
+                diagnostic.start("commit_state")
             draft_forwards += count + bool(missing)
             event = dict(prefill=False, output_start=len(outputs), old_length=old_length,
                          input_ids=round_input, proposals=proposals, predictions=predictions,
@@ -119,13 +148,21 @@ def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_to
             rounds.append(event)
             if observer is not None:
                 observer(event, target_caches, draft_caches, logits)
+            if diagnostic is not None:
+                diagnostic.end()
         result = dict(output_ids=outputs, stop_reason="EOS" if not ignore_eos and outputs[-1] in stops else "达到生成上限",
                       proposed=proposed, accepted=accepted, verification_rounds=len(rounds),
                       target_forwards=1 + len(rounds), draft_forwards=draft_forwards,
-                      final_kv_length=target_caches[0].length, rounds=rounds)
+                      final_kv_length=target_caches[0].length, rounds=rounds,
+                      final_kv_lengths={"target": [c.length for c in target_caches],
+                                        "draft": [c.length for c in draft_caches]})
     finally:
+        if diagnostic is not None:
+            diagnostic.start("release")
         for cache in target_caches + draft_caches:
             cache.release()
+        if diagnostic is not None:
+            diagnostic.end()
     result["recovered"] = all(cache.length == 0 and cache._pool.num_free_blocks == cache._key.shape[0]
                               for cache in target_caches + draft_caches)
     return result
