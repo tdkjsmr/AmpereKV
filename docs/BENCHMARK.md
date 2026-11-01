@@ -314,6 +314,47 @@ python -m ampere_kv.bench_speculative_decode --mode diagnose --prompt cpp --outp
 
 JSON保存源码、完整输入/输出及指纹、原始样本、实际顺序、接受/补算/Graph计数和回收结果。正式配对进程共记录43请求（含预热）、2752输出；失败时没有完整graph_final，不补造全程终态。新模型/文本的性能和完整序列须分别检查。
 
+## 草稿V1 CUDA消融与固定位置归因（50485d9）
+
+源码`50485d9f4b5f774e3cc822348704c95d97ba93b8`，Run ID为`spec03-a-smoke-01`、`spec03-a-paired-01`、`spec03-a-stages-01`和`spec03-a-principle-01`。沿用上一节固定两模型、RTX3090、Torch2.5.1+cu124/CUDA12.4、Transformers4.51.0，B1/BF16/greedy。有限消融仅取原cpp输入41Token、固定64输出；五路径均保留两模型和同一个目标Graph池常驻，后者本次不重放。`spec-cuda-k2/k4`只将草稿单Token起草及补算改为融合BF16写入与V1 CUDA Decode；目标验证、Prefill及接受规则不变，草稿仍逐步取词。
+
+| 路径 | 三次整请求墙钟（ms，按实际出现顺序） | 中位数（ms） |
+|---|---|---:|
+| reference | 2486.660, 2468.708, 2483.483 | 2483.483 |
+| spec-k2 | 3315.257, 3335.042, 3314.740 | 3315.257 |
+| spec-cuda-k2 | 2843.469, 2857.234, 2840.237 | 2843.469 |
+| spec-k4 | 3590.173, 3574.297, 3578.857 | 3578.857 |
+| spec-cuda-k4 | 3000.273, 3013.350, 2984.845 | 3000.273 |
+
+每路径预热一次、三次交错正式样本，整请求计时口径沿用上一节。CUDA草稿K2/K4相对各自reference草稿耗时下降14.23%/16.17%，仍比普通reference多14.50%/20.81%。五路径完整64输出一致；三个进程共39请求全部回收，目标36层和草稿28层最终KV均104。新旧草稿计数逐请求相同：K2提议/接受53/36、验证27轮、目标/草稿前向28/72、补算18；K4为81/42、21轮、22/91、补算9。目标Graph只捕获一次、零重放；本表没有普通Graph性能样本。正式进程目标图池初始化522.524ms、附加allocated33869312字节，在计时外。
+
+独立阶段诊断的宿主区间如下，仍含原有等待；Events另存原始记录，不与宿主区间相加。
+
+| 阶段 | K2 reference→CUDA（ms） | K4 reference→CUDA（ms） |
+|---|---:|---:|
+| 草稿起草 | 1566.604→1203.920 | 2377.040→1843.841 |
+| 草稿补算 | 525.787→401.991 | 262.199→201.030 |
+| 目标验证 | 1204.207→1204.823 | 934.795→940.134 |
+
+起草加补算下降23.25%/22.52%，目标验证保持相近量级；这些单次诊断不混入正式中位数。
+
+原principle第37输出在独立缓存副本中重现。四格均从KV72开始，预测位置75、有效KV76；多Token路径写入77，其额外位置被因果掩码屏蔽。候选顺序固定为`[104186,105427]`：
+
+| 历史KV构建 | 当前逐Token前向：候选分数/argmax | 当前多Token前向：候选分数/argmax |
+|---|---|---|
+| 逐Token | [34.75,34.75] / 104186 | [34.5,34.75] / 105427 |
+| 历史分组 | [34.75,34.75] / 104186 | [34.5,34.75] / 105427 |
+
+历史KV并非逐位相同，整体相对L2为0.005552；但两种历史下，只改变当前前向形状都能重现选择翻转。固定多Token前向的同一归一化隐藏状态，再仅将LM Head投影从5行换成1行，两种历史下候选分数及argmax均不变；全词表最大误差分别0.125/0.0625。因此，仅词表投影形状不足以解释这次翻转，尚未逐算子定位隐藏状态计算。原输入仍保留完整序列分歧，不调整同分规则或精度。
+
+草稿Graph后端复用既有B1图接口，独立28层固定缓存与设备候选存储；每轮在目标验证边界合并取回候选和预测，真实补算继续执行。该实现的GPU正确性和性能尚待单独验证。`--compare-graph`正式配对只测原cpp/python两输入，六路径为reference、reference草稿K2/K4、Graph草稿K2/K4、普通graph-overlap；两模型与两套图池均常驻，初始化另列，整请求含资源归还及末尾等待。
+
+```bash
+python -m ampere_kv.check_speculative_decode --model --draft-backend graph --prompt hi --max-new-tokens 64
+python -m ampere_kv.bench_speculative_decode --compare-graph --mode smoke --prompt cpp --output /absolute/path/graph-smoke.json --run-id graph-smoke
+python -m ampere_kv.bench_speculative_decode --compare-graph --mode paired --output /absolute/path/graph-paired.json --run-id graph-paired
+```
+
 ## 复现说明
 
 整批测量入口为 `bench_external`，算子基准为 `paged_decode --benchmark`，流水消融入口和命令见上节。元数据合并上传版本完整标识为 `0ac0d950f31720ce47fa99a834bd98e2e33b5096`。

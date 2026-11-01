@@ -5,7 +5,7 @@ import argparse
 import torch
 
 from ampere_kv.paged_cache import PagedKVCache, PagedKVStorage
-from ampere_kv.runner import encode_prompt
+from ampere_kv.runner import encode_prompt, model_forward_batched
 from ampere_kv.speculative_decode import (eos_ids, forward_tokens, generate_speculative,
                                          load_pair, make_caches, select_prefix)
 
@@ -164,6 +164,75 @@ def check_draft_cuda(draft, ids):
 
 
 @torch.inference_mode()
+def check_draft_graph(draft, ids, graph):
+    eager = make_caches(draft, graph.capacity)
+    caches = graph.acquire(graph.capacity)
+    addresses = [(c._key.data_ptr(), c._value.data_ptr()) for c in caches]
+    before = graph.counts()
+
+    def equal_state():
+        assert addresses == [(c._key.data_ptr(), c._value.data_ptr()) for c in caches]
+        for actual, expected in zip(caches, eager):
+            assert actual.length == expected.length
+            for a, b in zip(actual.get(), expected.get()):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    def eager_step(current):
+        positions = current.new_tensor([[eager[0].length]])
+        return model_forward_batched(draft, current, positions, [[c] for c in eager])
+
+    def step(current):
+        expected = eager_step(current)
+        actual = graph.step(current, 0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.cuda.current_stream().synchronize()
+        equal_state()
+
+    try:
+        initial = ids[:, :15]
+        for state in (eager, caches):
+            forward_tokens(draft, initial, state)
+        for position in range(initial.shape[1], 34):
+            step(ids.new_tensor([[position + 7]]))
+        saved = [c.get() for c in caches]
+        freed = [set(c._table.block_ids[1:]) for c in caches]
+        for state in (eager, caches):
+            for cache in state:
+                cache.truncate(15)
+        for cache, original in zip(caches, saved):
+            for a, b in zip(cache.get(), original):
+                torch.testing.assert_close(a, b[:, :, :15], rtol=0, atol=0)
+        for position in range(15, 19):
+            step(ids.new_tensor([[position + 7]]))
+        for cache, original, blocks in zip(caches, saved, freed):
+            assert cache._table.block_ids[-1] in blocks
+            for a, b in zip(cache.get(), original):
+                torch.testing.assert_close(a, b[:, :, :19], rtol=0, atol=0)
+        # 真正连续起草四步；统一取回后逐步重算，最后候选另走真实补算。
+        proposed = graph.propose(23, 4)
+        values = proposed[0].tolist()
+        for index in range(4):
+            logits = eager_step(ids.new_tensor([[values[index]]]))
+            assert logits.argmax().item() == values[index + 1]
+        equal_state()
+        graph.repair(proposed[:, 4:5])
+        eager_step(ids.new_tensor([[values[4]]]))
+        equal_state()
+        for state in (eager, caches):
+            for cache in state:
+                cache.truncate(20)
+        step(ids.new_tensor([[31]]))
+    finally:
+        release(eager)
+        graph.release()
+    assert graph.counts()["captures"] == before["captures"] == 1
+    assert graph.counts()["device_tokens"] - before["device_tokens"] == 4
+    assert graph.counts()["repairs"] - before["repairs"] == 1
+    assert all(c.length == 0 and c._pool.num_free_blocks == c._key.shape[0] for c in caches)
+    print("[PASS] 草稿CUDA eager/Graph logits与28层KV严格一致；首次/跨16和32/截断重放/设备四步/真实补算/地址与回收")
+
+
+@torch.inference_mode()
 def check_verification(target, ids):
     for k in (2, 4):
         sets = [make_caches(target, ids.shape[1] + 5) for _ in range(3)]
@@ -205,8 +274,10 @@ def ordinary(target, ids, limit, ignore_eos):
     return output, tops
 
 
-def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="reference"):
+def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="reference", draft_graph=None):
     reference, tops = ordinary(target, ids, limit, ignore_eos)
+    graph_addresses = (tuple((c._key.data_ptr(), c._value.data_ptr()) for c in draft_graph.caches)
+                       if draft_backend == "graph" else None)
     for k, bound in ((2, limit), (4, limit), (4, 1), (4, 2)):
         addresses = {}
 
@@ -221,6 +292,8 @@ def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="re
                            for c in caches)
                 assert all(c._pool.num_free_blocks + len(c._table.block_ids) == c._key.shape[0] for c in caches)
             assert not {c._key.data_ptr() for c in targets} & {c._key.data_ptr() for c in drafts}
+            if graph_addresses is not None:
+                assert graph_addresses == tuple((c._key.data_ptr(), c._value.data_ptr()) for c in drafts)
             for index, token in enumerate(event["committed"]):
                 position = event["output_start"] + index
                 if position >= len(reference) or token != reference[position]:
@@ -230,12 +303,19 @@ def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="re
                     raise AssertionError("投机/普通greedy分歧；先定位同历史数值与位置，不放宽")
 
         result = generate_speculative(target, draft, ids, draft_tokens=k, max_new_tokens=bound,
-                                      ignore_eos=ignore_eos, observer=observe, draft_backend=draft_backend)
+                                      ignore_eos=ignore_eos, observer=observe, draft_backend=draft_backend,
+                                      draft_graph=draft_graph)
         assert result["output_ids"] == reference[:bound]
         assert result["final_kv_length"] == ids.shape[1] + len(result["output_ids"]) - 1
         assert result["proposed"] == sum(len(r["proposals"]) for r in result["rounds"])
         assert result["accepted"] == sum(r["accepted"] for r in result["rounds"])
         assert result["verification_rounds"] == len(result["rounds"]) and result["recovered"]
+        if draft_backend == "graph":
+            stats = result["draft_graph"]
+            assert stats["captures"] == 1 and stats["capture_delta"] == 0
+            assert stats["device_tokens"] == result["proposed"]
+            assert stats["replays"] == result["draft_forwards"] - 1 == stats["device_tokens"] + stats["repairs"]
+            print(f"[Graph] 同池跨请求复用：{stats}")
         print(f"[PASS] 草稿={draft_backend} K={k} 输出上限={bound}，完整序列={len(result['output_ids'])}Token与普通greedy一致，"
               f"提议/接受={result['proposed']}/{result['accepted']}，验证轮={result['verification_rounds']}，"
               f"接受长度={[r['accepted'] for r in result['rounds']]}，停止={result['stop_reason']}；两套KV/地址/回收通过")
@@ -244,7 +324,7 @@ def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="re
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", action="store_true")
-    parser.add_argument("--draft-backend", choices=("reference", "cuda"), default="reference")
+    parser.add_argument("--draft-backend", choices=("reference", "cuda", "graph"), default="reference")
     parser.add_argument("--prompt", default="hi")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--ignore-eos", action="store_true")
@@ -259,8 +339,14 @@ def main():
         check_draft_hf(draft, ids)
         if args.draft_backend == "cuda":
             check_draft_cuda(draft, ids)
+        graph = None
+        if args.draft_backend == "graph":
+            from ampere_kv.speculative_draft import DraftGraph
+            graph = DraftGraph(draft, max(48, ids.shape[1] + args.max_new_tokens))
+            check_draft_graph(draft, ids, graph)
         check_verification(target, ids)
-        check_generation(target, draft, ids, args.max_new_tokens, args.ignore_eos, draft_backend=args.draft_backend)
+        check_generation(target, draft, ids, args.max_new_tokens, args.ignore_eos,
+                         draft_backend=args.draft_backend, draft_graph=graph)
     print("[完成] 投机解码模型检查" if args.model else "[完成] CPU投机前缀与分页截断小用例")
 
 

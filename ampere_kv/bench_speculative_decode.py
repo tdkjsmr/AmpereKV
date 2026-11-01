@@ -1,4 +1,4 @@
-"""单请求五路径配对；正式墙钟与独立阶段诊断分开运行。"""
+"""单请求配对；正式墙钟与独立阶段诊断分开运行。"""
 
 import argparse
 from collections import Counter
@@ -25,6 +25,7 @@ PROMPTS = (
 )
 PATHS = ("reference", "spec-k2", "spec-k4", "graph-sync", "graph-overlap")
 DRAFT_PATHS = ("reference", "spec-k2", "spec-k4", "spec-cuda-k2", "spec-cuda-k4")
+GRAPH_PATHS = ("reference", "spec-k2", "spec-k4", "spec-graph-k2", "spec-graph-k4", "graph-overlap")
 OUTPUT_TOKENS = 64
 
 
@@ -174,6 +175,12 @@ def check_result(path, result, length):
     if not result["recovered"] or any(value != length + OUTPUT_TOKENS - 1
                                       for lengths in result["final_kv_lengths"].values() for value in lengths):
         raise AssertionError("最终有效KV长度或资源归还不符")
+    if path.startswith("spec-graph-"):
+        counts = result["draft_graph"]
+        if (counts["captures"] != 1 or counts["capture_delta"] or counts["device_tokens"] != result["proposed"]
+                or counts["replays"] != result["draft_forwards"] - 1
+                or counts["replays"] != counts["device_tokens"] + counts["repairs"]):
+            raise AssertionError("草稿Graph实际重放、设备候选、补算或捕获计数不符")
     if path.startswith("graph-"):
         if (result["graph"] != {"calls": 63, "fallbacks": 0, "replays": 63}
                 or result["capture_delta"] or result["captures"] != 1):
@@ -185,7 +192,11 @@ def check_result(path, result, length):
                 raise AssertionError("流水实际发射、提交或双轮在途计数不符")
 
 
-def difference(target, draft, item, path, expected, result):
+def draft_backend(path):
+    return "graph" if path.startswith("spec-graph-") else "cuda" if path.startswith("spec-cuda-") else "reference"
+
+
+def difference(target, draft, item, path, expected, result, draft_graph=None):
     actual = result["output_ids"]
     position = next((i for i, pair in enumerate(zip(expected, actual)) if pair[0] != pair[1]), None)
     if position is None:
@@ -201,7 +212,7 @@ def difference(target, draft, item, path, expected, result):
                 evidence["verification_top2"] = top2(logits[0, offset])
         generate_speculative(target, draft, item["gpu"], draft_tokens=int(path[-1]),
                              max_new_tokens=OUTPUT_TOKENS, ignore_eos=True, observer=observe,
-                             draft_backend="cuda" if path.startswith("spec-cuda-") else "reference")
+                             draft_backend=draft_backend(path), draft_graph=draft_graph)
     else:
         # CUDA eager只作同历史诊断，不冒充原Graph/流水的实际logits。
         caches = make_caches(target, item["gpu"].shape[1] + OUTPUT_TOKENS)
@@ -220,7 +231,7 @@ def difference(target, draft, item, path, expected, result):
     return evidence
 
 
-def evaluate(target, draft, scheduler, item, path, phase, index, report, expected, diagnostic=None):
+def evaluate(target, draft, scheduler, item, path, phase, index, report, expected, diagnostic=None, draft_graph=None):
     torch.cuda.synchronize()
     started = time.perf_counter()
     if path == "reference":
@@ -228,7 +239,7 @@ def evaluate(target, draft, scheduler, item, path, phase, index, report, expecte
     elif path.startswith("spec-"):
         result = generate_speculative(target, draft, item["gpu"], draft_tokens=int(path[-1]),
                                       max_new_tokens=OUTPUT_TOKENS, ignore_eos=True, diagnostic=diagnostic,
-                                      draft_backend="cuda" if path.startswith("spec-cuda-") else "reference")
+                                      draft_backend=draft_backend(path), draft_graph=draft_graph)
     else:
         result = graph_request(scheduler, item["gpu"], path == "graph-overlap")
     torch.cuda.synchronize()
@@ -241,26 +252,31 @@ def evaluate(target, draft, scheduler, item, path, phase, index, report, expecte
     check_result(path, result, item["gpu"].shape[1])
     if path.startswith("spec-"):
         row["speculative"] = speculative_counts(result, int(path[-1]))
+        if "draft_graph" in result:
+            row["draft_graph"] = result["draft_graph"]
     else:
         row.update({key: result[key] for key in ("graph", "captures", "pipeline", "max_inflight") if key in result})
     if diagnostic:
         row["stages"] = diagnostic.report()
     if expected is not None:
-        row["difference"] = difference(target, draft, item, path, expected, result)
+        row["difference"] = difference(target, draft, item, path, expected, result, draft_graph)
         if row["difference"] is not None:
             print(f"[分歧] 输入={item['id']} 路径={path} 证据={row['difference']}")
             raise RuntimeError("完整输出不一致；该输入不生成性能结论，已保留原始样本与首处分歧")
     if phase == "warmup":
         print(f"[检查] 输入={item['id']} 路径={path} 输出=64 回收={row['recovered']} "
-              f"Graph={row.get('graph')} 投机计数={row.get('speculative', {}).get('totals')}")
+              f"Graph={row.get('draft_graph', row.get('graph'))} 投机计数={row.get('speculative', {}).get('totals')}")
     return result["output_ids"]
 
 
 @torch.inference_mode()
 def run(args, report):
     target, draft, tokenizer = load_pair()
-    paths = DRAFT_PATHS if args.compare_draft else PATHS
-    selected = PROMPTS if args.mode == "paired" and not args.compare_draft else [next(p for p in PROMPTS if p[0] == args.prompt)]
+    paths = GRAPH_PATHS if args.compare_graph else DRAFT_PATHS if args.compare_draft else PATHS
+    if args.mode == "paired" and not args.compare_draft:
+        selected = PROMPTS[:2] if args.compare_graph else PROMPTS
+    else:
+        selected = [next(p for p in PROMPTS if p[0] == args.prompt)]
     inputs = []
     for name, text in selected:
         ids = encode_prompt(tokenizer, text)
@@ -269,22 +285,28 @@ def run(args, report):
     report["inputs"] = [{key: value for key, value in item.items() if key != "gpu"} for item in inputs]
     report["resident_allocated_before_graph_bytes"] = torch.cuda.memory_allocated()
     scheduler, report["graph_initialization"] = initialize_graph(target, inputs)
+    draft_graph = None
+    if args.compare_graph:
+        from ampere_kv.speculative_draft import DraftGraph
+        draft_graph = DraftGraph(draft, max(item["gpu"].shape[1] for item in inputs) + OUTPUT_TOKENS)
+        report["draft_graph_initialization"] = draft_graph.initialization
+        print(f"[初始化] 草稿独立B1图池={draft_graph.initialization}")
     print(f"[初始化] 两模型常驻；共用B1图池={report['graph_initialization']}")
     for item in inputs:
         expected = evaluate(target, draft, scheduler, item, "reference", "warmup", 0, report, None)
         if args.mode == "diagnose":
-            for path in (paths[1:] if args.compare_draft else PATHS[1:3]):
-                evaluate(target, draft, scheduler, item, path, "warmup", 0, report, expected)
-                evaluate(target, draft, scheduler, item, path, "diagnostic", 0, report, expected, Stages())
+            for path in (paths[1:-1] if args.compare_graph else paths[1:] if args.compare_draft else PATHS[1:3]):
+                evaluate(target, draft, scheduler, item, path, "warmup", 0, report, expected, draft_graph=draft_graph)
+                evaluate(target, draft, scheduler, item, path, "diagnostic", 0, report, expected, Stages(), draft_graph)
                 print(f"[阶段] 输入={item['id']} 路径={path} {report['runs'][-1]['stages']}")
             continue
         for path in paths[1:]:
-            evaluate(target, draft, scheduler, item, path, "warmup", 0, report, expected)
+            evaluate(target, draft, scheduler, item, path, "warmup", 0, report, expected, draft_graph=draft_graph)
         orders = [paths] if args.mode == "smoke" else [paths, paths[::-1], paths[2:] + paths[:2]]
         for repeat, order in enumerate(orders):
             report["orders"].append(dict(input=item["id"], repeat=repeat, paths=list(order)))
             for path in order:
-                evaluate(target, draft, scheduler, item, path, "sample", repeat, report, expected)
+                evaluate(target, draft, scheduler, item, path, "sample", repeat, report, expected, draft_graph=draft_graph)
         summary = {}
         for path in paths:
             samples = [row["wall_ms"] for row in report["runs"]
@@ -292,7 +314,8 @@ def run(args, report):
             median = statistics.median(samples)
             summary[path] = dict(samples_ms=samples, median_ms=median, output_tokens_per_s=64000 / median)
             print(f"[配对] 输入={item['id']} Token={item['input_tokens']} 路径={path} 样本={samples} 中位={median:.3f}ms")
-        best = None if args.compare_draft else min(("graph-sync", "graph-overlap"), key=lambda path: summary[path]["median_ms"])
+        best = None if args.compare_draft else "graph-overlap" if args.compare_graph else min(
+            ("graph-sync", "graph-overlap"), key=lambda path: summary[path]["median_ms"])
         ratios = {}
         for path in paths:
             if not path.startswith("spec-"):
@@ -300,19 +323,23 @@ def run(args, report):
             bases = ["reference"]
             if best:
                 bases.append(best)
-            elif path.startswith("spec-cuda-"):
+            if path.startswith(("spec-cuda-", "spec-graph-")):
                 bases.append(f"spec-k{path[-1]}")
             ratios[path] = {base: summary[base]["median_ms"] / summary[path]["median_ms"] for base in bases}
         report["summaries"][item["id"]] = dict(paths=summary, faster_graph_path=best,
                                                speculative_ratios=ratios)
     report["graph_final"] = graph_counts(scheduler)
+    if draft_graph is not None:
+        report["draft_graph_final"] = draft_graph.counts()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("smoke", "paired", "diagnose"), default="smoke")
     parser.add_argument("--prompt", choices=[name for name, text in PROMPTS], default="cpp")
-    parser.add_argument("--compare-draft", action="store_true", help="只测所选输入的reference/CUDA草稿消融，保留同一常驻图池")
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument("--compare-draft", action="store_true", help="只测所选输入的reference/CUDA草稿消融，保留同一常驻图池")
+    comparison.add_argument("--compare-graph", action="store_true", help="草稿Graph六路径；paired只测cpp/python，所有路径共用常驻两模型及两套图池")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args()
@@ -325,10 +352,11 @@ def main():
                   config=dict(target=[MODEL_ID, MODEL_REVISION], draft=[DRAFT_ID, DRAFT_REVISION],
                               batch=1, dtype="bfloat16", output_tokens=64, ignore_eos=True,
                               template=dict(enable_thinking=False, add_generation_prompt=True, tokenizer="target"),
-                              compare_draft=args.compare_draft, draft_cuda_kernel="V1",
+                              compare_draft=args.compare_draft, compare_graph=args.compare_graph, draft_cuda_kernel="V1",
                               warmups=1, repeats=3 if args.mode == "paired" else int(args.mode == "smoke"),
                               resident_models="target+draft", shared_graph_pool_all_paths=True,
-                              request_pools="reference:target; spec:target+draft; graph:常驻池复用",
+                              request_pools=("reference:target; spec-reference:target+draft; spec-graph:target+常驻draft; graph:常驻target"
+                                             if args.compare_graph else "reference:target; spec:target+draft; graph:常驻池复用"),
                               timing="整请求含Prefill/宿主Token/资源归还与末尾等待；准备/捕获/比较在计时外",
                               stages="独立诊断含已有取词等待；宿主与GPU流区间可重叠，不相加"))
     try:
