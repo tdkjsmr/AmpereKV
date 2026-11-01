@@ -44,11 +44,11 @@ def make_caches(model, capacity):
             for _ in model.model.layers]
 
 
-def forward_tokens(model, ids, caches, *, all_logits=False):
+def forward_tokens(model, ids, caches, *, all_logits=False, cuda_decode=False):
     start = caches[0].length
     positions = torch.arange(start, start + ids.shape[1], device=ids.device).unsqueeze(0)
     return model_forward(model, ids, positions, caches, is_prefill=start == 0 or ids.shape[1] > 1,
-                         all_logits=all_logits)
+                         all_logits=all_logits, cuda_decode=cuda_decode and start > 0 and ids.shape[1] == 1)
 
 
 def select_prefix(proposals, predictions, remaining, stops, ignore_eos=False):
@@ -66,10 +66,12 @@ def select_prefix(proposals, predictions, remaining, stops, ignore_eos=False):
 
 @torch.inference_mode()
 def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_tokens=64,
-                         ignore_eos=False, observer=None, diagnostic=None):
+                         ignore_eos=False, observer=None, diagnostic=None, draft_backend="reference"):
     """轮首两套KV均不含最后一个已输出Token；observer仅供正确性检查读取。"""
     if draft_tokens not in (2, 4) or not 1 <= max_new_tokens <= 64:
         raise ValueError("草稿长度仅支持2/4，输出上限须为1至64")
+    if draft_backend not in ("reference", "cuda"):
+        raise ValueError("当前草稿后端仅支持reference/cuda")
     if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
         raise ValueError("输入须为单条非空Token序列")
     if input_ids.dtype != torch.long or not input_ids.is_cuda:
@@ -108,7 +110,8 @@ def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_to
             if diagnostic is not None:
                 diagnostic.start("drafting", gpu=True)
             for _ in range(count):
-                logits = forward_tokens(draft, input_ids.new_tensor([[token]]), draft_caches)
+                logits = forward_tokens(draft, input_ids.new_tensor([[token]]), draft_caches,
+                                        cuda_decode=draft_backend == "cuda")
                 token = logits[0, -1].argmax().item()
                 proposals.append(token)
             if diagnostic is not None:
@@ -133,7 +136,7 @@ def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_to
             if missing:
                 if diagnostic is not None:
                     diagnostic.start("repair", gpu=True)
-                forward_tokens(draft, input_ids.new_tensor([missing]), draft_caches)
+                forward_tokens(draft, input_ids.new_tensor([missing]), draft_caches, cuda_decode=draft_backend == "cuda")
                 if diagnostic is not None:
                     diagnostic.end()
             if diagnostic is not None:
@@ -153,7 +156,7 @@ def generate_speculative(target, draft, input_ids, *, draft_tokens=2, max_new_to
         result = dict(output_ids=outputs, stop_reason="EOS" if not ignore_eos and outputs[-1] in stops else "达到生成上限",
                       proposed=proposed, accepted=accepted, verification_rounds=len(rounds),
                       target_forwards=1 + len(rounds), draft_forwards=draft_forwards,
-                      final_kv_length=target_caches[0].length, rounds=rounds,
+                      final_kv_length=target_caches[0].length, rounds=rounds, draft_backend=draft_backend,
                       final_kv_lengths={"target": [c.length for c in target_caches],
                                         "draft": [c.length for c in draft_caches]})
     finally:
@@ -172,6 +175,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", default="hi")
     parser.add_argument("--draft-tokens", type=int, choices=(2, 4), default=2)
+    parser.add_argument("--draft-backend", choices=("reference", "cuda"), default="reference")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--ignore-eos", action="store_true")
     args = parser.parse_args()
@@ -180,10 +184,11 @@ def main():
     target, draft, tokenizer = load_pair()
     ids = encode_prompt(tokenizer, args.prompt)
     result = generate_speculative(target, draft, ids, draft_tokens=args.draft_tokens,
-                                  max_new_tokens=args.max_new_tokens, ignore_eos=args.ignore_eos)
+                                  max_new_tokens=args.max_new_tokens, ignore_eos=args.ignore_eos,
+                                  draft_backend=args.draft_backend)
     print(f"generated_token_ids = {result['output_ids']}")
     print(f"generated_text = {tokenizer.decode(result['output_ids'], skip_special_tokens=True)!r}")
-    print(f"[统计] 输入={ids.shape[1]}，K={args.draft_tokens}，输出={len(result['output_ids'])}，"
+    print(f"[统计] 草稿={result['draft_backend']}，输入={ids.shape[1]}，K={args.draft_tokens}，输出={len(result['output_ids'])}，"
           f"提议={result['proposed']}，接受={result['accepted']}，验证轮={result['verification_rounds']}，"
           f"接受长度={[r['accepted'] for r in result['rounds']]}，停止={result['stop_reason']}，回收={result['recovered']}")
 

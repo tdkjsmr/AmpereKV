@@ -113,6 +113,57 @@ def compare_logits(actual, expected, label):
 
 
 @torch.inference_mode()
+def check_draft_cuda(draft, ids):
+    initial = ids[:, :15]
+    sets = [make_caches(draft, 48) for _ in range(2)]
+    addresses = [[(c._key.data_ptr(), c._value.data_ptr()) for c in caches] for caches in sets]
+    maximum, relative, pairs = 0.0, 0.0, 0
+
+    def step(current):
+        nonlocal maximum, relative, pairs
+        values = [forward_tokens(draft, current, caches, cuda_decode=bool(i)) for i, caches in enumerate(sets)]
+        delta = values[1].float() - values[0].float()
+        maximum = max(maximum, delta.abs().max().item())
+        relative = max(relative, (delta.norm() / values[0].float().norm().clamp_min(1e-12)).item())
+        assert all(torch.isfinite(value).all() for value in values)
+        if values[0].argmax().item() != values[1].argmax().item():
+            print(f"[分歧] 草稿同历史长度={sets[0][0].length} reference={candidates(values[0][0, -1])} "
+                  f"cuda={candidates(values[1][0, -1])}")
+            raise AssertionError("草稿reference/CUDA同历史选词分歧")
+        pairs += 1
+        expected = sets[0][0].length
+        assert all(c.length == expected for caches in sets for c in caches)
+        for caches, pointers in zip(sets, addresses):
+            assert pointers == [(c._key.data_ptr(), c._value.data_ptr()) for c in caches]
+
+    try:
+        step(initial)
+        for position in range(initial.shape[1], 34):
+            step(ids.new_tensor([[position + 7]]))
+        snapshots = [[c.get() for c in caches] for caches in sets]
+        freed = [[set(c._table.block_ids[1:]) for c in caches] for caches in sets]
+        for caches, saved in zip(sets, snapshots):
+            for cache, (key, value) in zip(caches, saved):
+                cache.truncate(15)
+                assert cache.length == 15 and len(cache._table.block_ids) == 1
+                for actual, original in zip(cache.get(), (key, value)):
+                    torch.testing.assert_close(actual, original[:, :, :15], rtol=0, atol=0)
+        for position in range(15, 19):
+            step(ids.new_tensor([[position + 7]]))
+        for caches, saved, released in zip(sets, snapshots, freed):
+            assert all(c.length == 19 and len(c._table.block_ids) == 2 for c in caches)
+            for cache, original, tail in zip(caches, saved, released):
+                assert cache._table.block_ids[-1] in tail
+                for actual, expected in zip(cache.get(), original):
+                    torch.testing.assert_close(actual, expected[:, :, :19], rtol=0, atol=0)
+    finally:
+        for caches in sets:
+            release(caches)
+    print(f"[观测] 草稿reference/CUDA同历史{pairs}步：最大绝对误差={maximum:.7g}，最大相对L2={relative:.7g}")
+    print("[PASS] 草稿Q16/KV8 V1：跨16/32边界、截断15后重放、有效前缀/地址/长度与回收")
+
+
+@torch.inference_mode()
 def check_verification(target, ids):
     for k in (2, 4):
         sets = [make_caches(target, ids.shape[1] + 5) for _ in range(3)]
@@ -154,7 +205,7 @@ def ordinary(target, ids, limit, ignore_eos):
     return output, tops
 
 
-def check_generation(target, draft, ids, limit, ignore_eos):
+def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="reference"):
     reference, tops = ordinary(target, ids, limit, ignore_eos)
     for k, bound in ((2, limit), (4, limit), (4, 1), (4, 2)):
         addresses = {}
@@ -179,13 +230,13 @@ def check_generation(target, draft, ids, limit, ignore_eos):
                     raise AssertionError("投机/普通greedy分歧；先定位同历史数值与位置，不放宽")
 
         result = generate_speculative(target, draft, ids, draft_tokens=k, max_new_tokens=bound,
-                                      ignore_eos=ignore_eos, observer=observe)
+                                      ignore_eos=ignore_eos, observer=observe, draft_backend=draft_backend)
         assert result["output_ids"] == reference[:bound]
         assert result["final_kv_length"] == ids.shape[1] + len(result["output_ids"]) - 1
         assert result["proposed"] == sum(len(r["proposals"]) for r in result["rounds"])
         assert result["accepted"] == sum(r["accepted"] for r in result["rounds"])
         assert result["verification_rounds"] == len(result["rounds"]) and result["recovered"]
-        print(f"[PASS] K={k} 输出上限={bound}，完整序列={len(result['output_ids'])}Token与普通greedy一致，"
+        print(f"[PASS] 草稿={draft_backend} K={k} 输出上限={bound}，完整序列={len(result['output_ids'])}Token与普通greedy一致，"
               f"提议/接受={result['proposed']}/{result['accepted']}，验证轮={result['verification_rounds']}，"
               f"接受长度={[r['accepted'] for r in result['rounds']]}，停止={result['stop_reason']}；两套KV/地址/回收通过")
 
@@ -193,6 +244,7 @@ def check_generation(target, draft, ids, limit, ignore_eos):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", action="store_true")
+    parser.add_argument("--draft-backend", choices=("reference", "cuda"), default="reference")
     parser.add_argument("--prompt", default="hi")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--ignore-eos", action="store_true")
@@ -205,8 +257,10 @@ def main():
         target, draft, tokenizer = load_pair()
         ids = encode_prompt(tokenizer, args.prompt)
         check_draft_hf(draft, ids)
+        if args.draft_backend == "cuda":
+            check_draft_cuda(draft, ids)
         check_verification(target, ids)
-        check_generation(target, draft, ids, args.max_new_tokens, args.ignore_eos)
+        check_generation(target, draft, ids, args.max_new_tokens, args.ignore_eos, draft_backend=args.draft_backend)
     print("[完成] 投机解码模型检查" if args.model else "[完成] CPU投机前缀与分页截断小用例")
 
 

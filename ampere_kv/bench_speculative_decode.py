@@ -24,6 +24,7 @@ PROMPTS = (
     ("principle", "请用中文解释 Transformer 自注意力中 Q、K、V 的作用，以及因果掩码为什么能防止读取未来信息。"),
 )
 PATHS = ("reference", "spec-k2", "spec-k4", "graph-sync", "graph-overlap")
+DRAFT_PATHS = ("reference", "spec-k2", "spec-k4", "spec-cuda-k2", "spec-cuda-k4")
 OUTPUT_TOKENS = 64
 
 
@@ -199,7 +200,8 @@ def difference(target, draft, item, path, expected, result):
                 evidence["verification_event"] = event.copy()
                 evidence["verification_top2"] = top2(logits[0, offset])
         generate_speculative(target, draft, item["gpu"], draft_tokens=int(path[-1]),
-                             max_new_tokens=OUTPUT_TOKENS, ignore_eos=True, observer=observe)
+                             max_new_tokens=OUTPUT_TOKENS, ignore_eos=True, observer=observe,
+                             draft_backend="cuda" if path.startswith("spec-cuda-") else "reference")
     else:
         # CUDA eager只作同历史诊断，不冒充原Graph/流水的实际logits。
         caches = make_caches(target, item["gpu"].shape[1] + OUTPUT_TOKENS)
@@ -225,14 +227,16 @@ def evaluate(target, draft, scheduler, item, path, phase, index, report, expecte
         result = reference(target, item["gpu"])
     elif path.startswith("spec-"):
         result = generate_speculative(target, draft, item["gpu"], draft_tokens=int(path[-1]),
-                                      max_new_tokens=OUTPUT_TOKENS, ignore_eos=True, diagnostic=diagnostic)
+                                      max_new_tokens=OUTPUT_TOKENS, ignore_eos=True, diagnostic=diagnostic,
+                                      draft_backend="cuda" if path.startswith("spec-cuda-") else "reference")
     else:
         result = graph_request(scheduler, item["gpu"], path == "graph-overlap")
     torch.cuda.synchronize()
     wall_ms = (time.perf_counter() - started) * 1000
     row = dict(input=item["id"], path=path, phase=phase, repeat=index, wall_ms=wall_ms,
                output_ids=result["output_ids"], output_sha256=digest(result["output_ids"]),
-               final_kv_lengths=result["final_kv_lengths"], recovered=result["recovered"])
+               final_kv_lengths=result["final_kv_lengths"], recovered=result["recovered"],
+               draft_backend=result.get("draft_backend"))
     report["runs"].append(row)
     check_result(path, result, item["gpu"].shape[1])
     if path.startswith("spec-"):
@@ -255,7 +259,8 @@ def evaluate(target, draft, scheduler, item, path, phase, index, report, expecte
 @torch.inference_mode()
 def run(args, report):
     target, draft, tokenizer = load_pair()
-    selected = PROMPTS if args.mode == "paired" else [next(p for p in PROMPTS if p[0] == args.prompt)]
+    paths = DRAFT_PATHS if args.compare_draft else PATHS
+    selected = PROMPTS if args.mode == "paired" and not args.compare_draft else [next(p for p in PROMPTS if p[0] == args.prompt)]
     inputs = []
     for name, text in selected:
         ids = encode_prompt(tokenizer, text)
@@ -268,30 +273,38 @@ def run(args, report):
     for item in inputs:
         expected = evaluate(target, draft, scheduler, item, "reference", "warmup", 0, report, None)
         if args.mode == "diagnose":
-            for k in (2, 4):
-                path = f"spec-k{k}"
+            for path in (paths[1:] if args.compare_draft else PATHS[1:3]):
                 evaluate(target, draft, scheduler, item, path, "warmup", 0, report, expected)
                 evaluate(target, draft, scheduler, item, path, "diagnostic", 0, report, expected, Stages())
-                print(f"[阶段] 输入={item['id']} K={k} {report['runs'][-1]['stages']}")
+                print(f"[阶段] 输入={item['id']} 路径={path} {report['runs'][-1]['stages']}")
             continue
-        for path in PATHS[1:]:
+        for path in paths[1:]:
             evaluate(target, draft, scheduler, item, path, "warmup", 0, report, expected)
-        orders = [PATHS] if args.mode == "smoke" else [PATHS, PATHS[::-1], PATHS[2:] + PATHS[:2]]
+        orders = [paths] if args.mode == "smoke" else [paths, paths[::-1], paths[2:] + paths[:2]]
         for repeat, order in enumerate(orders):
             report["orders"].append(dict(input=item["id"], repeat=repeat, paths=list(order)))
             for path in order:
                 evaluate(target, draft, scheduler, item, path, "sample", repeat, report, expected)
         summary = {}
-        for path in PATHS:
+        for path in paths:
             samples = [row["wall_ms"] for row in report["runs"]
                        if row["input"] == item["id"] and row["path"] == path and row["phase"] == "sample"]
             median = statistics.median(samples)
             summary[path] = dict(samples_ms=samples, median_ms=median, output_tokens_per_s=64000 / median)
             print(f"[配对] 输入={item['id']} Token={item['input_tokens']} 路径={path} 样本={samples} 中位={median:.3f}ms")
-        best = min(("graph-sync", "graph-overlap"), key=lambda path: summary[path]["median_ms"])
+        best = None if args.compare_draft else min(("graph-sync", "graph-overlap"), key=lambda path: summary[path]["median_ms"])
+        ratios = {}
+        for path in paths:
+            if not path.startswith("spec-"):
+                continue
+            bases = ["reference"]
+            if best:
+                bases.append(best)
+            elif path.startswith("spec-cuda-"):
+                bases.append(f"spec-k{path[-1]}")
+            ratios[path] = {base: summary[base]["median_ms"] / summary[path]["median_ms"] for base in bases}
         report["summaries"][item["id"]] = dict(paths=summary, faster_graph_path=best,
-            speculative_ratios={path: {base: summary[base]["median_ms"] / summary[path]["median_ms"]
-                                      for base in ("reference", best)} for path in ("spec-k2", "spec-k4")})
+                                               speculative_ratios=ratios)
     report["graph_final"] = graph_counts(scheduler)
 
 
@@ -299,6 +312,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("smoke", "paired", "diagnose"), default="smoke")
     parser.add_argument("--prompt", choices=[name for name, text in PROMPTS], default="cpp")
+    parser.add_argument("--compare-draft", action="store_true", help="只测所选输入的reference/CUDA草稿消融，保留同一常驻图池")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     args = parser.parse_args()
@@ -311,6 +325,7 @@ def main():
                   config=dict(target=[MODEL_ID, MODEL_REVISION], draft=[DRAFT_ID, DRAFT_REVISION],
                               batch=1, dtype="bfloat16", output_tokens=64, ignore_eos=True,
                               template=dict(enable_thinking=False, add_generation_prompt=True, tokenizer="target"),
+                              compare_draft=args.compare_draft, draft_cuda_kernel="V1",
                               warmups=1, repeats=3 if args.mode == "paired" else int(args.mode == "smoke"),
                               resident_models="target+draft", shared_graph_pool_all_paths=True,
                               request_pools="reference:target; spec:target+draft; graph:常驻池复用",
