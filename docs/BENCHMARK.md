@@ -1,54 +1,60 @@
-# 固定负载性能与执行取舍
+# 性能与执行取舍
 
-本报告记录RTX3090上的外部整批对比、Graph与流水消融、动态到达延迟取舍。整批完成时间、动态请求延迟与Nsight诊断分别列出配置和统计。
+数据来自单张RTX3090（24GiB），目标为固定Qwen3-8B，BF16权重。AmpereKV环境为Python3.12.3、Torch2.5.1+cu124、CUDA12.4、Transformers4.51.0；vLLM单独使用0.29.0、Torch2.13.0+cu130/CUDA13.0。各节按各自源码、输入与计时口径配对，原始样本、Run ID和初始化成本分别保留。
 
-历史实验的提交哈希标识对应测量版本；归档源码与输入的获取要求见文末复现说明。
+离线整批统计到输出ID回宿主及资源回收；动态负载从计划到达统计延迟，窗口与含排空吞吐分列；Nsight记录只用于解释执行机制。固定容量INT8 KV计入scale后的布局字节比为1.9248×，约减少48.05%KV字节；它与最大上下文实测、模型端到端性能分别计量。
 
-## 测量定义
+## 投机解码
 
-- GPU：同一台 RTX 3090（24 GiB，驱动 `595.71.05`）；模型为 `Qwen/Qwen3-8B`，Revision `b968826d9c46dd6066d109eabc6255188de91218`，BF16 权重。AmpereKV 使用 BF16 KV，vLLM 配置 `kv_cache_dtype=auto`。版本分别为 AmpereKV `914c026` 与 vLLM `0.29.0`，两引擎独立环境、分时驻留。
-- 输入为同一份 Token ID 文件；B=1/B=4，每请求 512 输入、固定生成 32 Token，greedy、忽略 EOS、关闭前缀复用。逐 Run 核对输入指纹。
-- 各进程预热 1 次，测量 5 次；计时从输入提交到全部输出 ID 回到宿主侧。模型加载、分词、输入准备、预热和建池在计时外。AmpereKV 接收预建 CUDA 张量，vLLM 接收宿主 Token ID 列表。
-- 请求配置：AmpereKV 为 BF16/V1、块大小 16、整段 Prefill、`mixed=False`、无自建 Graph；vLLM 请求 `max_model_len=1024`、`max_num_seqs=4`、`kv_cache_dtype=auto`，采样器设置 `VLLM_USE_FLASHINFER_SAMPLER=0`。vLLM 的实际后端、Graph/Chunk 和 KV 预算以对应成功进程日志为准。
-- 每个 B 按 AmpereKV→vLLM→vLLM→AmpereKV 运行，分别报告五样本、中位数和极差，并计算同顺序配对的完成时间比。
+源码`16c02d5fc51793ee71bae9dfdcfda0ef9f5a8c94`，Run ID为`spec03-b-smoke-01`、`spec03-b-paired-01`，工作区干净。目标Qwen3-8B@b968826d9c46dd6066d109eabc6255188de91218、草稿Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca，RTX3090、Torch2.5.1+cu124/CUDA12.4和Transformers4.51.0，B1/BF16/greedy、固定64输出并忽略EOS。原cpp/python输入分别41/39Token，输入IDs与SPEC02一致。
 
-## Eager 路径与 vLLM 对比（914c026）
+草稿Graph后端复用既有B1图接口，独立28层固定缓存与设备候选存储；每个草稿步在GPU执行argmax，下一步直接读取设备Token，每轮在目标验证边界合并取回候选和预测，真实补算继续执行。argmax在前向图外、同一流上执行。`--compare-graph`测六路径：reference、reference草稿K2/K4、Graph草稿K2/K4、普通graph-overlap。两模型与目标/草稿两套图池在全部路径中常驻，捕获在计时外；Graph草稿复用常驻草稿池，reference草稿每请求分配逻辑缓存及物理池，实际分配差异保留在整请求口径中。
 
-| B | 顺序 | 引擎 | Run ID | 五次完成时间（ms） | 中位数（ms） | 范围（ms） | 输出吞吐中位数（Token/s） |
-|---:|:---:|:---|:---|:---|---:|---:|---:|
-| 1 | A→V | AmpereKV | g7-b1-a1 | 1219.776, 1214.810, 1213.335, 1203.485, 1207.982 | 1213.335 | 16.291 | 26.374 |
-| 1 | A→V | vLLM | g7-b1-v1 | 745.840, 743.050, 744.809, 744.045, 744.312 | 744.312 | 2.790 | 42.993 |
-| 1 | V→A | vLLM | g7-b1-v2 | 741.343, 745.636, 742.076, 739.152, 741.014 | 741.343 | 6.484 | 43.165 |
-| 1 | V→A | AmpereKV | g7-b1-a2 | 1216.639, 1213.374, 1248.568, 1221.421, 1222.408 | 1221.421 | 35.194 | 26.199 |
-| 4 | A→V | AmpereKV | g7-b4-a1 | 1787.912, 1762.931, 1762.056, 1773.577, 1833.220 | 1773.577 | 71.164 | 72.171 |
-| 4 | A→V | vLLM | g7-b4-v1 | 1097.150, 1057.032, 1100.921, 1058.886, 1058.963 | 1058.963 | 43.889 | 120.873 |
-| 4 | V→A | vLLM | g7-b4-v2 | 1103.302, 1104.227, 1064.000, 1064.046, 1106.675 | 1103.302 | 42.675 | 116.015 |
-| 4 | V→A | AmpereKV | g7-b4-a2 | 1775.248, 1824.464, 1790.758, 1792.871, 1798.857 | 1792.871 | 49.216 | 71.394 |
+正式每路径预热一次、三次样本，顺序正序、逆序、旋转两位。整请求墙钟含Prefill、宿主ID可用、资源归还和末尾等待；模型加载、图初始化、结果核对与打印在计时外。
 
-同顺序配对的 AmpereKV/vLLM 完成时间中位数比：B=1 为 `1.630×`、`1.648×`，B=4 为 `1.675×`、`1.625×`。反向顺序的同引擎中位数变化：B=1 AmpereKV `0.67%`、vLLM `0.40%`；B=4 AmpereKV `1.09%`、vLLM `4.19%`，均低于预设的 `5%` 环境复核线。
+| 输入 | 路径 | 三次整请求墙钟（ms，按实际出现顺序） | 中位数（ms） |
+|---|---|---|---:|
+| cpp | reference | 2540.217, 2522.224, 2513.760 | 2522.224 |
+| cpp | spec-k2 | 3378.437, 3409.610, 3338.154 | 3378.437 |
+| cpp | spec-k4 | 3667.926, 3666.498, 3633.115 | 3666.498 |
+| cpp | spec-graph-k2 | 1597.664, 1603.861, 1629.494 | 1603.861 |
+| cpp | spec-graph-k4 | 1430.302, 1430.313, 1429.561 | 1430.302 |
+| cpp | graph-overlap | 1518.285, 1519.618, 1517.928 | 1518.285 |
+| python | reference | 2508.611, 2518.612, 2514.801 | 2514.801 |
+| python | spec-k2 | 3061.869, 3052.783, 3085.561 | 3061.869 |
+| python | spec-k4 | 3141.318, 3164.452, 3210.499 | 3164.452 |
+| python | spec-graph-k2 | 1441.601, 1457.572, 1437.445 | 1441.601 |
+| python | spec-graph-k4 | 1246.038, 1246.357, 1251.604 | 1246.357 |
+| python | graph-overlap | 1522.123, 1523.164, 1522.737 | 1522.737 |
 
-八个 Run 均报告每请求 512 输入、32 输出；输入文件 SHA256 为 `3262a3904a3c8dfa6d85b8cd63bdc64647783a0d5cd4604496c5166b6362dd80`，选中 ID 的 SHA256：B=1 为 `e2d1ac38a473406a5e9a26f46a65ba54941fa9eaba11d09d76bf550b1942e36c`，B=4 为 `22e0ff4cf8fd7422ecd69d068d732d196bd46fb9fc278e3a4ee1df40faf1291a`。输出数分别为 `[32]` 与 `[32,32,32,32]`；各日志的 `914c026` 是本项目基准入口提交，vLLM 软件版本单独锁定为 `0.29.0`。
+按未舍入中位数，Graph草稿K2/K4相对各自reference草稿的整请求耗时，cpp下降52.53%/60.99%，python下降52.92%/60.61%。相对普通graph-overlap，cpp K2多5.64%耗时、K4下降5.79%；python K2/K4下降5.33%/18.15%。K4对应吞吐为44.746/51.350Token/s，相对普通Graph为1.062/1.222倍。两条输入分别报告，不将收益推广到其他负载。
 
-八个结果 JSON 记录 Python `3.12.3`、上述 GPU/驱动、模型 Revision 和五个完整样本。AmpereKV 使用 PyTorch `2.5.1+cu124` / CUDA `12.4`，vLLM 使用 PyTorch `2.13.0+cu130` / CUDA `13.0`。
+冒烟12请求、正式48请求，共3840个输出ID；每条输入各路径完整64输出均与reference及SPEC02历史输出一致。目标36层最终KV分别104/102，投机草稿28层也为104/102，所有请求回收。正式与预热的同输入同K在新旧草稿间逐轮事件完全一致：
 
-四个 vLLM 测量进程的启动配置一致：Chunked Prefill 启用，`max_num_batched_tokens=4096`；Attention 为 `FLASH_ATTN` / FlashAttention 2；PIECEWISE/FULL Graph 捕获完成；KV 预算 `5.88 GiB`、容量 `42,800 Token`；`VLLM_USE_FLASHINFER_SAMPLER=0`，`max_model_len=1024`，`max_num_seqs=4`。
+| 输入/K | 提议/实际接受 | 验证轮 | 目标/草稿前向（含Prefill） | 真实补算 | 每请求草稿图重放 |
+|---|---:|---:|---:|---:|---:|
+| cpp K2 | 53/36 | 27 | 28/72 | 18 | 71 |
+| cpp K4 | 81/42 | 21 | 22/91 | 9 | 90 |
+| python K2 | 46/39 | 24 | 25/67 | 20 | 66 |
+| python K4 | 68/45 | 18 | 19/79 | 10 | 78 |
 
-## 内部消融：固定 RoPE 频率复用
+收益未伴随验证轮或接受轨迹变化。优化组合包含原生CUDA草稿前向、Graph、设备连续Token和常驻草稿池复用；本轮没有隔离每一项的独立贡献，也未测得单次草稿前向的纯执行时间。旧草稿逐Token取词改为每验证轮统一取回候选/预测，元数据仍由宿主准备上传；减少的是该路径的逐Token取词点，不声称消除全部同步。
 
-同一 RTX 3090、B=1/B=4、512 输入/32 固定输出；旧提交 `a19a66a` 与新提交 `914c026`，每进程预热 1 次、测量 5 次。顺序旧→新→新→旧，以下只在各顺序对内比较；对应输出指纹不变。
+正式进程目标图初始化510.044ms、附加allocated33869312字节；草稿图初始化169.851ms、附加allocated21682688字节（20.678MiB），容量均112。两套图各捕获一次；草稿实际累计1220重放=992提议步+228补算，目标普通Graph累计504重放、零Decode回退。冒烟草稿322重放=268提议步+54补算。初始化显存增量是分配状态差，不作为最大上下文容量。
 
-| B | 顺序对 | 旧版五样本（ms）/中位数 | 新版五样本（ms）/中位数 | 新版完成时间降低 |
-|---:|:---:|:---|:---|---:|
-| 1 | 旧→新 | 1378.741, 1382.144, 1382.681, 1385.718, 1386.522 / 1382.681 | 1208.197, 1205.226, 1208.321, 1210.355, 1207.444 / 1208.197 | 12.62% |
-| 1 | 新→旧 | 1390.707, 1378.239, 1372.658, 1376.401, 1374.858 / 1376.401 | 1209.952, 1210.862, 1208.245, 1210.002, 1196.194 / 1209.952 | 12.09% |
-| 4 | 旧→新 | 1973.174, 2004.251, 1942.045, 1955.716, 1946.537 / 1955.716 | 1764.673, 1762.904, 1766.771, 1766.382, 1763.794 / 1764.673 | 9.77% |
-| 4 | 新→旧 | 1995.330, 2087.706, 1988.565, 1981.235, 1986.881 / 1988.565 | 1796.480, 1798.880, 1812.104, 1798.426, 1797.410 / 1798.426 | 9.56% |
+独立Graph检查覆盖跨块、截断重放、实际补算和同池跨请求；旧默认短回归通过。多Token验证与逐Token路径可能在BF16近同分处选词不同，已记录该案例。
 
-另一次 B=4 单批 Nsight Systems 诊断中，旧→新 `cudaMemcpyAsync` 与 `cudaStreamSynchronize` 均为 `4066→2698` 次，Kernel launch 均为 `84590` 次。减少的 1368 次与 38 次前向 × 36 层吻合。
+```bash
+python -m ampere_kv.check_speculative_decode --model --draft-backend graph --prompt hi --max-new-tokens 64
+python -m ampere_kv.bench_speculative_decode --compare-graph --mode smoke --prompt cpp --output /absolute/path/graph-smoke.json --run-id graph-smoke
+python -m ampere_kv.bench_speculative_decode --compare-graph --mode paired --output /absolute/path/graph-paired.json --run-id graph-paired
+```
 
-## Graph 路径开关消融与 vLLM 对比（7e6bf9b）
+此前原生CUDA草稿消融源码`50485d9f4b5f774e3cc822348704c95d97ba93b8`，Run `spec03-a-paired-01`：同cpp输入，K2/K4中位数由3315.257/3578.857ms降到2843.469/3000.273ms，即14.23%/16.17%，仍慢于reference的2483.483ms。独立`spec03-a-stages-01`起草加补算宿主区间下降23.25%/22.52%，目标验证相近；阶段区间含等待，不与正式样本合并。
 
-被测提交为 `7e6bf9b`，与上一组 Eager 外部对比独立。同一 RTX 3090（驱动 `595.71.05`）按 E→G→V→V→G→E 顺序运行：E 为同提交 AmpereKV Graph 关闭，G 为 Graph 开启，V 为 vLLM `0.29.0`；B=1/B=4 均每请求 512 输入、固定 32 输出，预热 1 次、正式测量 5 次。下表记录原始五样本，单位 ms；Run ID 与结果 JSON 的 `run_id` 字段一致。
+## 离线整批：Graph与vLLM
+
+被测提交为 `7e6bf9b`。同一 RTX 3090（驱动 `595.71.05`）按 E→G→V→V→G→E 顺序运行：E 为同提交 AmpereKV Graph 关闭，G 为 Graph 开启，V 为 vLLM `0.29.0`；B=1/B=4 均每请求 512 输入、固定 32 输出，预热 1 次、正式测量 5 次。下表记录原始五样本，单位 ms；Run ID 与结果 JSON 的 `run_id` 字段一致。
 
 | B | Run ID | 路径 | 五次整批完成时间（ms） | 中位数（ms） | 极差（ms） |
 | ---: | --- | --- | --- | ---: | ---: |
@@ -71,9 +77,22 @@
 
 G 使用 BF16/V1、块16、整段 Prefill、`mixed=False`，捕获容量 544 Token、块表宽34；E 保留原 eager。B=1 每样本 Graph 31 次、回退0、捕获总数1；B=4 每样本 Graph 30 次（B4 28、B1 2）、回退4（B2/B3）、捕获总数2，正式重复未重捕获。捕获初始化墙钟：B1 两个 G Run 为 `500.339/516.043 ms`，B4 为 `726.895/722.910 ms`；对应 `allocated` 状态差为 `+17,382,400/+27,192,320` 字节，`reserved` 状态差为 `+46,137,344/+90,177,536` 字节。初始化耗时及显存状态差单独记录。B4 单批 Nsight 时间线中 30 次 `cudaGraphLaunch` 与 28 次 B4、2 次 B1 Graph 范围对应。
 
-该组 vLLM 启动配置同前：Chunked Prefill（`max_num_batched_tokens=4096`）、FLASH_ATTN/FlashAttention 2、PIECEWISE/FULL Graph、KV 预算 `5.88 GiB`、容量 `42,800 Token`，`VLLM_USE_FLASHINFER_SAMPLER=0`。AmpereKV 使用 PyTorch `2.5.1+cu124` / CUDA `12.4`，vLLM 使用 PyTorch `2.13.0+cu130` / CUDA `13.0`。
+vLLM启动配置：Chunked Prefill（`max_num_batched_tokens=4096`）、FLASH_ATTN/FlashAttention 2、PIECEWISE/FULL Graph、KV 预算 `5.88 GiB`、容量 `42,800 Token`，`VLLM_USE_FLASHINFER_SAMPLER=0`。AmpereKV 使用 PyTorch `2.5.1+cu124` / CUDA `12.4`，vLLM 使用 PyTorch `2.13.0+cu130` / CUDA `13.0`。
 
 计时包含调度、前向、输出取回与回收，初始化在计时外。B1 开启 Graph 时同时切换到批量 B1 前向入口，因此 E/G 衡量的是整条执行路径的变化。
+
+## 内部消融：固定 RoPE 频率复用
+
+同一 RTX 3090、B=1/B=4、512 输入/32 固定输出；旧提交 `a19a66a` 与新提交 `914c026`，每进程预热 1 次、测量 5 次。顺序旧→新→新→旧，以下只在各顺序对内比较；对应输出指纹不变。
+
+| B | 顺序对 | 旧版五样本（ms）/中位数 | 新版五样本（ms）/中位数 | 新版完成时间降低 |
+|---:|:---:|:---|:---|---:|
+| 1 | 旧→新 | 1378.741, 1382.144, 1382.681, 1385.718, 1386.522 / 1382.681 | 1208.197, 1205.226, 1208.321, 1210.355, 1207.444 / 1208.197 | 12.62% |
+| 1 | 新→旧 | 1390.707, 1378.239, 1372.658, 1376.401, 1374.858 / 1376.401 | 1209.952, 1210.862, 1208.245, 1210.002, 1196.194 / 1209.952 | 12.09% |
+| 4 | 旧→新 | 1973.174, 2004.251, 1942.045, 1955.716, 1946.537 / 1955.716 | 1764.673, 1762.904, 1766.771, 1766.382, 1763.794 / 1764.673 | 9.77% |
+| 4 | 新→旧 | 1995.330, 2087.706, 1988.565, 1981.235, 1986.881 / 1988.565 | 1796.480, 1798.880, 1812.104, 1798.426, 1797.410 / 1798.426 | 9.56% |
+
+另一次 B=4 单批 Nsight Systems 诊断中，旧→新 `cudaMemcpyAsync` 与 `cudaStreamSynchronize` 均为 `4066→2698` 次，Kernel launch 均为 `84590` 次。减少的 1368 次与 38 次前向 × 36 层吻合。
 
 ## Graph 元数据合并上传消融（7e6bf9b → 0ac0d95）
 
@@ -94,13 +113,13 @@ G 使用 BF16/V1、块16、整段 Prefill、`mixed=False`，捕获容量 544 Tok
 
 单批 B=4 Nsight Systems 诊断中，旧→新 `cudaGraphLaunch` 均30次、`cudaLaunchKernel` 均18326次；`cudaMemcpyAsync` 为 `4918→628` 次，`cudaStreamSynchronize` 为 `2698→568` 次。GPU 侧 H2D 为 `2660→530` 次、总量均约 `1.287 MB`，D2D 为 `2220→60` 次、总量约 `1.151→0.002 MB`。次数差与30个 Graph 步每步减少71次 H2D、72次 D2D的预期吻合。采集中的 B4 Graph NVTX 投影均值为 `27.635→25.267 ms`。新版每步构造一份 CPU 元数据张量并执行一次阻塞 H2D。
 
-## DI-02：受限单步流水消融（f5d5c33）
+## 单步流水
 
 本节测量 **512 输入 / 256 输出** 的三路流水消融，实测源码为 `f5d5c3351ae6d15bcc6ae5590f29558e7aaf8f7f`。
 
 ### 配置与计时
 
-- 日期：2026-10-23；同一 RTX 3090（24 GiB），Qwen/Qwen3-8B，Revision `b968826d9c46dd6066d109eabc6255188de91218`；PyTorch `2.5.1+cu124`、CUDA `12.4`。Windows 只做源码和证据分析，实际模型及计时在 CUDA 环境执行。
+- 日期：2026-10-23；同一 RTX 3090（24 GiB），Qwen/Qwen3-8B，Revision `b968826d9c46dd6066d109eabc6255188de91218`；PyTorch `2.5.1+cu124`、CUDA `12.4`。
 - 单卡、BF16 权重/KV、V1、块16、整段同步 Prefill、greedy、`ignore_eos=True`、`mixed=False`。B=1/B=4 每请求固定生成256个 Token，最后有效 KV 长度767。
 - 同进程复用模型、KV池和固定 B1/B4 Graph；容量768、块表宽48，每层池容量为 B×49 块。三路均先用8输出预热，再按 **A→B→C→C→B→A→A→B→C** 测量，每路3样本，样本间恢复空池。
 - 从现成 CUDA 输入提交开始，计入宿主驱动、输入更新、前向、输出取回与提交、最终等待和回收。模型加载、分词、输入准备、建池、捕获、槽初始化和预热在计时外；`drain_ms` 已包含在 `total_s` 中。
@@ -152,16 +171,9 @@ C 最后输出后的收尾中位数为 B1/B4 `0.406 / 0.333 ms`，已计入总�
 | 上一轮 CPU post 时长 | 中位47.520 µs |
 | post 完成后当前 Graph 剩余跨度 | 至少18.646 ms |
 
-例如，Graph13 的设备跨度为64.559504—89.377665 ms，CPU post12 为64.562892—64.615959 ms，实际设备活动交集52.491 µs，显示当前轮 GPU 执行与上一轮 CPU 提交确实重叠。总体收益还包括下一轮准备/提交与前一轮 GPU 执行的交叠；约46 µs的 CPU post 交集是其中一个观察量。
-
 ### 复现入口与输入指纹
 
-先按 README 准备兼容 CUDA 环境、固定模型缓存和扩展。固定 `v2.0.1` 不含流水入口；精确源码使用上述完整 SHA。已有干净克隆可执行：
-
-```bash
-git fetch origin codex/deepinfer-decode-handoff
-git switch --detach f5d5c3351ae6d15bcc6ae5590f29558e7aaf8f7f
-```
+精确测量源码为本节标识的完整SHA；当前main保留相同基准入口。
 
 输入为 UTF-8 JSON，顶层 `prompts` 数组至少4条，每条为512个模型词表内的整数 Token ID。程序在计时外读取并转为 CUDA 张量，B1使用第一条，B4使用前四条。文件字节参与 `input_file_sha256`，前四条规范化 ID 参与 `source_ids_sha256`；`templates` 和 `template_sequence_sha256` 标识输入模板及输出上限。
 
@@ -179,18 +191,6 @@ for B in 1 4; do
     --pipeline abc --output-tokens 256 --repeats 3 --input "$INPUT_JSON" \
     --output "$BENCH_DIR/abc-b$B.json" --run-id "di02-repro-abc-b$B"
 done
-```
-
-另行采集短时间线：
-
-```bash
-nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
-  --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=stop \
-  --output="$BENCH_DIR/c-profile" \
-  python -m ampere_kv.bench_workload --mode steady --batch 4 --cuda-graph \
-    --pipeline c --output-tokens 256 --profile-rounds 10 16 --input "$INPUT_JSON" \
-    --output "$BENCH_DIR/c-profile.json" --run-id di02-repro-c-profile
-nsys export --type sqlite --output "$BENCH_DIR/c-profile.sqlite" "$BENCH_DIR/c-profile.nsys-rep"
 ```
 
 结果 JSON 保存提交、配置、输入/输出摘要、前向与 Graph/丢弃计数、显存和回收情况。先核对工作量，再比较 `total_s`。
@@ -222,7 +222,7 @@ nsys export --type sqlite --output "$BENCH_DIR/c-profile.sqlite" "$BENCH_DIR/c-p
 
 初始化单列：B1/B4语法编译分别83.576/83.226ms；建池与捕获的墙钟按eager-reference、graph-reference、graph-cuda顺序分别为B1 `1.263/503.618/203.608 ms`、B4 `1.617/419.308/417.436 ms`。这些初始化不计入表中正式样本。
 
-按README准备当前开发分支、固定模型缓存和XGrammar依赖后，运行既有入口；结果路径须在仓库外：
+按README准备main、固定模型缓存和XGrammar依赖后，运行既有入口；结果路径须在仓库外：
 
 ```bash
 python -m ampere_kv.check_structured_output --model
@@ -243,11 +243,9 @@ python -m ampere_kv.bench_structured_output --batches 1 4 \
 
 Run ID为`load02-pair{1,2,3}-{a,b}01`和`load04-pair{1,2,3}-{a,b}01`，各进程含steady/burst一次；A/B分别对应表中箭头两端。两组分别核对输入/完整到达表、逐模板输出摘要、工作量和回收。LOAD02的steady Graph调用覆盖从2.14%—5.71%升至100%，捕获增加17.75MiB allocated、44MiB reserved，墙钟配对增量中位380.124ms。LOAD04全部场景Graph100%命中、零回退，12场1536请求全部完成；steady窗口输出吞吐变化中位−0.345%，排空多81.5—86.8ms，burst窗口吞吐不变。固定到达率下的窗口吞吐不等于最大持续处理能力。
 
-时间线定位版本`e1ff14e`，Run ID为`load03-steady-on01`、`load03-steady-profile01`、`load03-insert01`：无工具记录558个间隔中，33个跨新请求Prefill的长间隔约162—165ms；代表例为Prefill 142.038ms后再执行约25.123ms Decode。Prefill可见GPU工作并集134.342ms；其中宿主同步与GPU工作重叠，不能把等待另加到阶段耗时。Graph内部未展开。固定轮次插入AB/BA将旧请求局部间隔增加138.193/138.826ms，与插入Prefill 137.902/138.428ms相符。
-
 保留整段Prefill默认，256分块作为显式实验。分块把长停顿拆短，但每场3968个间隔中，超过100ms的数量steady为253→506、burst为448→896；该界线仅描述频次。burst准入等待中位还增加40.34%。后续块仍需执行完整层栈并读回历史，这与早期小Chunk变慢的负结果相容；读回改进前后的历史观察不与本表混算，也不据此推断更小Chunk会更快。当前两种负载都没有支持全局开启分块的综合收益。
 
-开发分支的当前复现入口如下；用自备四条512 Token输入时记录新指纹和Run ID，复现原始配对则使用对应归档输入与提交：
+当前复现入口如下；用自备四条512 Token输入时记录新指纹和Run ID，复现原始配对则使用对应归档输入与提交：
 
 ```bash
 python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
@@ -258,107 +256,8 @@ python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
 
 将块长改为256运行另一独立进程；B1/B4对照显式传`--graph-batches 1 4`。阶段定位沿用`profile_arrivals --capture`及`--mode insert`；记录与Profiler采集用于解释机制，正式配对不启用它们。
 
-## 单请求投机解码：部分配对结果与阶段成本（0a5f39e）
-
-测量源码`0a5f39ef983fb7bb53ce71eda4fd38c316ba7efd`，Run ID为`spec02-smoke-01`、`spec02-paired-01`、`spec02-stages-01`。RTX3090、Python3.12.3、Torch2.5.1+cu124/CUDA12.4、Transformers4.51.0；目标Qwen3-8B固定`b968826d9c46dd6066d109eabc6255188de91218`，草稿Qwen3-0.6B固定`c1899de289a04d12100db370d81485cdf75e47ca`。B1/BF16/greedy，K2/K4，每请求固定64输出、忽略EOS。输入取该提交`bench_speculative_decode.PROMPTS`的C++知识、Python代码、中文原理三条公开文本，按目标对话模板编码，实际长度41/39/40Token。
-
-`reference`是SPEC01同类的同步SDPA逐Token参考；`spec-k2/k4`为独立草稿投机；`graph-sync`与`graph-overlap`复用同一套既有B1 CUDA Decode Graph和KV池，分别同步step与流水C驱动。两模型及图池在五路径中均常驻。整请求墙钟含Prefill、宿主ID可用、每请求资源归还和末尾等待；reference每请求建目标池，投机建两模型池，Graph复用常驻池。输入准备、模型加载、建图池/捕获、比较及打印在计时外。正式每路径预热一次、测三次，顺序正序→逆序→旋转两位；不启用阶段挂点。
-
-**正式整批状态为failed。** C++与Python各五路径三样本完整输出一致，逐层KV长度为P+63，块全部归还。第三条原理输入在K4预热时分歧，没有正式样本；下表只保留已完成的两输入，不作为三输入全部通过的结果。
-
-| 输入 | 路径 | 三次整请求墙钟（ms，按实际出现顺序） | 中位数（ms） |
-|---|---|---|---:|
-| cpp，41输入 | reference | 2498.465, 2474.301, 2475.895 | 2475.895 |
-| cpp | spec-k2 | 3310.978, 3294.417, 3299.032 | 3299.032 |
-| cpp | spec-k4 | 3588.607, 3565.567, 3563.169 | 3565.567 |
-| cpp | graph-sync | 1519.392, 1524.520, 1526.833 | 1524.520 |
-| cpp | graph-overlap | 1507.464, 1508.836, 1510.052 | 1508.836 |
-| python，39输入 | reference | 2476.886, 2465.520, 2492.689 | 2476.886 |
-| python | spec-k2 | 3060.120, 3006.956, 3008.845 | 3008.845 |
-| python | spec-k4 | 3085.493, 3089.423, 3084.412 | 3085.493 |
-| python | graph-sync | 1521.259, 1521.034, 1527.416 | 1521.259 |
-| python | graph-overlap | 1507.697, 1508.323, 1508.913 | 1508.323 |
-
-按未舍入中位数，cpp的K2/K4比reference多33.25%/44.01%耗时，python多21.48%/24.57%；相对本次较快的graph-overlap，分别为2.186/2.363倍与1.995/2.046倍耗时。两输入分别比较，没有合并平均加速比。所有图请求每次63重放、零Decode回退，一次捕获且不重捕获；流水实际双在途、63提交、零丢弃。正式进程初始化530.796ms，附加allocated为33869312字节，其中常驻KV池16515072字节；图容量112、每层7块，初始化不计入上表。
-
-| 输入/路径 | 提议/实际接受 | 验证轮 | 目标/草稿前向（含Prefill） | 草稿补算 |
-|---|---:|---:|---:|---:|
-| cpp K2 | 53/36 | 27 | 28/72 | 18 |
-| cpp K4 | 81/42 | 21 | 22/91 | 9 |
-| python K2 | 46/39 | 24 | 25/67 | 20 |
-| python K4 | 68/45 | 18 | 19/79 | 10 |
-
-计数来自原轮事件，额外/修正Token不计接受数，短剩余预算和普通末步单列。目标前向减少，但草稿起草与补算增加了执行次数。
-
-独立`spec02-stages-01`只诊断cpp，K2/K4各一次；完整64输出和计数与正式cpp相同。下表宿主阶段含原有取词等待，CUDA Events是流上区间，可包含宿主供给间隙；两列不相加，也不当成内核忙碌时间。这些诊断数据不混入正式三样本。
-
-| 阶段 | K2宿主（ms） | K2流Events（ms） | K4宿主（ms） | K4流Events（ms） |
-|---|---:|---:|---:|---:|
-| 目标Prefill | 39.331 | 40.040 | 38.858 | 40.149 |
-| 草稿Prefill | 27.589 | 25.535 | 27.207 | 25.553 |
-| 草稿起草 | 1613.508 | 1576.118 | 2427.771 | 2405.994 |
-| 目标验证 | 1240.593 | 1215.412 | 952.829 | 945.179 |
-| 草稿补算 | 545.854 | 539.965 | 267.412 | 267.839 |
-
-诊断整请求墙钟为3472.093/3718.453ms。草稿起草加补算的互不重叠宿主区间为2159.361/2695.183ms，占各自诊断墙钟62.19%/72.48%；平均每次起草约30.44/29.97ms。分配、首词、尾部截断、提交、回收宿主区间合计仅3.072/2.706ms。本次主要成本在草稿执行路径；尚未将其进一步分解为算子、分页读回或启动开销。
-
-第三输入K4在第37个输出首分歧，前36个一致。参考选择104186，K4选择105427；同历史参考重跑中候选105427/104186均34.75，K4验证中为34.75/34.5。该轮接受前三草稿后提交目标修正105427，验证行/位置和缓存长度对账正确。证据支持近同分翻转，历史分组计算的数值累积与当步形状效应仍未拆分；该输入保持失败，不放宽阈值。
-
-复现三个独立模式，输出路径放在仓库外；先冒烟、再正式配对、最后独立诊断，分歧时保留失败JSON和先前正常样本：
-
-```bash
-python -m ampere_kv.bench_speculative_decode --mode smoke --output /absolute/path/spec-smoke.json --run-id spec-smoke
-python -m ampere_kv.bench_speculative_decode --mode paired --output /absolute/path/spec-paired.json --run-id spec-paired
-python -m ampere_kv.bench_speculative_decode --mode diagnose --prompt cpp --output /absolute/path/spec-stages.json --run-id spec-stages
-```
-
-JSON保存源码、完整输入/输出及指纹、原始样本、实际顺序、接受/补算/Graph计数和回收结果。正式配对进程共记录43请求（含预热）、2752输出；失败时没有完整graph_final，不补造全程终态。新模型/文本的性能和完整序列须分别检查。
-
-## 草稿V1 CUDA消融与固定位置归因（50485d9）
-
-源码`50485d9f4b5f774e3cc822348704c95d97ba93b8`，Run ID为`spec03-a-smoke-01`、`spec03-a-paired-01`、`spec03-a-stages-01`和`spec03-a-principle-01`。沿用上一节固定两模型、RTX3090、Torch2.5.1+cu124/CUDA12.4、Transformers4.51.0，B1/BF16/greedy。有限消融仅取原cpp输入41Token、固定64输出；五路径均保留两模型和同一个目标Graph池常驻，后者本次不重放。`spec-cuda-k2/k4`只将草稿单Token起草及补算改为融合BF16写入与V1 CUDA Decode；目标验证、Prefill及接受规则不变，草稿仍逐步取词。
-
-| 路径 | 三次整请求墙钟（ms，按实际出现顺序） | 中位数（ms） |
-|---|---|---:|
-| reference | 2486.660, 2468.708, 2483.483 | 2483.483 |
-| spec-k2 | 3315.257, 3335.042, 3314.740 | 3315.257 |
-| spec-cuda-k2 | 2843.469, 2857.234, 2840.237 | 2843.469 |
-| spec-k4 | 3590.173, 3574.297, 3578.857 | 3578.857 |
-| spec-cuda-k4 | 3000.273, 3013.350, 2984.845 | 3000.273 |
-
-每路径预热一次、三次交错正式样本，整请求计时口径沿用上一节。CUDA草稿K2/K4相对各自reference草稿耗时下降14.23%/16.17%，仍比普通reference多14.50%/20.81%。五路径完整64输出一致；三个进程共39请求全部回收，目标36层和草稿28层最终KV均104。新旧草稿计数逐请求相同：K2提议/接受53/36、验证27轮、目标/草稿前向28/72、补算18；K4为81/42、21轮、22/91、补算9。目标Graph只捕获一次、零重放；本表没有普通Graph性能样本。正式进程目标图池初始化522.524ms、附加allocated33869312字节，在计时外。
-
-独立阶段诊断的宿主区间如下，仍含原有等待；Events另存原始记录，不与宿主区间相加。
-
-| 阶段 | K2 reference→CUDA（ms） | K4 reference→CUDA（ms） |
-|---|---:|---:|
-| 草稿起草 | 1566.604→1203.920 | 2377.040→1843.841 |
-| 草稿补算 | 525.787→401.991 | 262.199→201.030 |
-| 目标验证 | 1204.207→1204.823 | 934.795→940.134 |
-
-起草加补算下降23.25%/22.52%，目标验证保持相近量级；这些单次诊断不混入正式中位数。
-
-原principle第37输出在独立缓存副本中重现。四格均从KV72开始，预测位置75、有效KV76；多Token路径写入77，其额外位置被因果掩码屏蔽。候选顺序固定为`[104186,105427]`：
-
-| 历史KV构建 | 当前逐Token前向：候选分数/argmax | 当前多Token前向：候选分数/argmax |
-|---|---|---|
-| 逐Token | [34.75,34.75] / 104186 | [34.5,34.75] / 105427 |
-| 历史分组 | [34.75,34.75] / 104186 | [34.5,34.75] / 105427 |
-
-历史KV并非逐位相同，整体相对L2为0.005552；但两种历史下，只改变当前前向形状都能重现选择翻转。固定多Token前向的同一归一化隐藏状态，再仅将LM Head投影从5行换成1行，两种历史下候选分数及argmax均不变；全词表最大误差分别0.125/0.0625。因此，仅词表投影形状不足以解释这次翻转，尚未逐算子定位隐藏状态计算。原输入仍保留完整序列分歧，不调整同分规则或精度。
-
-草稿Graph后端复用既有B1图接口，独立28层固定缓存与设备候选存储；每轮在目标验证边界合并取回候选和预测，真实补算继续执行。该实现的GPU正确性和性能尚待单独验证。`--compare-graph`正式配对只测原cpp/python两输入，六路径为reference、reference草稿K2/K4、Graph草稿K2/K4、普通graph-overlap；两模型与两套图池均常驻，初始化另列，整请求含资源归还及末尾等待。
-
-```bash
-python -m ampere_kv.check_speculative_decode --model --draft-backend graph --prompt hi --max-new-tokens 64
-python -m ampere_kv.bench_speculative_decode --compare-graph --mode smoke --prompt cpp --output /absolute/path/graph-smoke.json --run-id graph-smoke
-python -m ampere_kv.bench_speculative_decode --compare-graph --mode paired --output /absolute/path/graph-paired.json --run-id graph-paired
-```
-
 ## 复现说明
 
-整批测量入口为 `bench_external`，算子基准为 `paged_decode --benchmark`，流水消融入口和命令见上节。元数据合并上传版本完整标识为 `0ac0d950f31720ce47fa99a834bd98e2e33b5096`。
+按[README](../README.MD)准备固定模型、兼容环境和扩展。算子入口为`paged_decode --benchmark`，离线整批为`bench_external`，流水为`bench_workload`，动态负载为`bench_arrivals`，投机为`bench_speculative_decode`。
 
-- 各组数据对应各自的源码、配置与输入，配对比较在组内进行。部分历史源码和原始输入保存在独立归档中；使用自备输入时记录新的 Run ID、提交和结果。
-- 整批计时、动态到达统计和Nsight采集分开；初始化耗时与显存状态差单独列出。vLLM的实际后端、Graph和Chunk来自启动日志。
-- 原始输入与采集文件保留在私有归档。公开采集文件前需清除环境变量等敏感信息。
+结果路径使用仓库外的绝对路径。JSON保存源码SHA、配置、原始样本、输入/输出指纹、Graph/接受/补算计数和回收结果。使用自备输入时记录新指纹和Run ID；历史原始证据私有归档，本文历史数值不改标为精简候选源码的新测量。

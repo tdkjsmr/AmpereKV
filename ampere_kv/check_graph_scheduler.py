@@ -146,7 +146,6 @@ def check_case(model, lengths):
     if graph.replays != steps:
         raise AssertionError("Graph 重放次数与真实 Decode 步数不一致")
     close_paths(paths, sum((length + steps + 15) // 16 for length in lengths))
-    print(f"[PASS] B={len(lengths)} 历史={tuple(lengths)}：常规eager/静态缓冲eager/Graph 四步 logits、选词、36层KV、地址、块归属与回收严格一致；重放={graph.replays}，块表发生变化")
 
 
 def prompt(model, length, offset):
@@ -292,22 +291,14 @@ def drive(model, lengths, limits, max_batch, max_tokens, *, lifecycle=False, bat
         assert added and reused and new_hit and graph.graph_calls > after_new and graph.graph_captures == len(captured_batches)
         if {2, 3} <= captured_batches:
             assert {2, 3} <= post_stop_batches and 3 in new_batches
-        print(f"[PASS] Graph后取消/到期：后续子批={sorted(post_stop_batches)}，新请求复用块并命中={sorted(new_batches)}；"
-              f"邻座序列与eager一致，捕获仍为{graph.graph_captures}")
     elif boundary_check:
         assert (max_tokens - 1, "Graph") in boundary and (max_tokens, "eager") in boundary
         assert graph.graph_calls > 0 and graph.graph_fallbacks > 0 and graph.graph_captures == len(captured_batches)
-        print(f"[PASS] B{max_batch}容量边界：最后命中起点={max_tokens - 1}，下一步回退起点={max_tokens}；"
-              f"命中={graph.graph_calls}，回退={graph.graph_fallbacks}，捕获={graph.graph_captures}")
     else:
         assert {1, 2, 3, 4} <= sizes_seen
         assert all(g.replays > 0 for g in graph.graphs.values())
         assert (graph.graph_fallbacks == 0) == (captured_batches == {1, 2, 3, 4})
         assert graph.graph_captures == len(captured_batches)
-        replays = {b: g.replays for b, g in graph.graphs.items()}
-        print(f"[PASS] B4逐步准入/退场：子批={sorted(sizes_seen)}，重放={replays}；"
-              f"命中={graph.graph_calls}，回退={graph.graph_fallbacks}，捕获={graph.graph_captures}")
-    print(f"[PASS] 逐请求完整输出、停止原因、36层长度/地址/块隔离与归还一致；块表上传核对={uploads}")
 
 
 def main():
@@ -322,7 +313,6 @@ def main():
             pass
         else:
             raise AssertionError("首次提交后或混合模式错误启用了 Graph")
-    print("[PASS] 首次提交后与 mixed 模式拒绝启用 Graph；默认路径未捕获")
     for lengths in ([15], [15, 16], [15, 16, 63], [15, 16, 63, 64]):
         check_case(model, lengths)
     for batch in (1, 2, 3):

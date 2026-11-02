@@ -13,16 +13,11 @@ from ampere_kv.quantization import quantize_kv
 
 @torch.inference_mode()
 def benchmark() -> None:
-    """SDPA 连续参考与 BF16/INT8 的 V1/V3 内部 Decode 入口配对基线；不等于纯内核耗时。"""
+    """配对计时含扩展调用、分段临时结果与组末等待，准备与数值核对在计时外。"""
     generator = torch.Generator().manual_seed(0)
     warmup, repeats, iterations = 5, 3, 20
     begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     print(f"调用基线：Q头=32，KV头=8，每头128维，块大小16；预热={warmup} 次，测量={repeats} 组，每组={iterations} 次")
-    print("Q/K/V、量化、GQA 展开与 GPU 块表都在计时外准备；被测的是内部入口，与模型生成路径一致，无宿主块号同步。")
-    print("墙钟包含 Python/扩展调用、输出分配与组末等待；CUDA Event 测量同组调用的设备时间窗口，包含派发间隙。")
-    print("各组重复读取相同数据。")
-    print("CUDA 段长=64；长度超过 64 时启用分段，临时结果分配与合并调用均计入；修改段长后须重新编译扩展。")
-    print("V1=每块一个 Query 头，V3=同组四个 Query 头共享一次 K/V 载入；两者在同一轮内交替测量，V1 仍是默认路径。")
     for length in (64, 256, 1024, 4096):
         blocks = length // 16
         query = torch.randn(1, 32, 1, 128, generator=generator).to(device="cuda", dtype=torch.bfloat16)
@@ -71,14 +66,8 @@ def benchmark() -> None:
                                     ("BF16 V3/连续SDPA", bf16_v3_call().float(), expected.float()),
                                     ("INT8/同量化数据", int8_actual.float(), int8_expected),
                                     ("INT8 V3/同量化数据", int8_v3_call().float(), int8_expected)):
-                error = (got - want).abs().max().item()
-                print(f"[诊断] 长度={length}，计时外 {name} 最大绝对误差={error:.8g}，rtol=0.01，atol=0.002")
                 assert torch.isfinite(got).all() and torch.isfinite(want).all()
                 torch.testing.assert_close(got, want, rtol=0.01, atol=0.002)
-            # V3 只改复用与并行度，每头算术次序与 V1 相同；只记录差异，不要求逐位相同。
-            print(f"[诊断] 长度={length}，V3 与 V1 最大绝对差：BF16="
-                  f"{(bf16_v3_call().float() - actual.float()).abs().max().item():.8g}，INT8="
-                  f"{(int8_v3_call().float() - int8_actual.float()).abs().max().item():.8g}")
             calls = (("SDPA连续", sdpa_call), ("CUDA BF16 V1", bf16_call), ("CUDA BF16 V3", bf16_v3_call),
                      ("CUDA INT8 V1", int8_call), ("CUDA INT8 V3", int8_v3_call))
             for _, call in calls:
@@ -106,7 +95,7 @@ def benchmark() -> None:
             cache.release()
             int8_cache.release()
         assert storage._pool.num_free_blocks == blocks and int8_storage._pool.num_free_blocks == blocks
-    print("[完成] 四种长度的 SDPA/BF16/INT8 与 V1/V3 配对基线；不能据此宣称独立内核或端到端加速比")
+    print("[完成] 分页Decode调用基准")
 
 
 @torch.inference_mode()
@@ -137,7 +126,6 @@ def check_bf16_write() -> None:
     finally:
         cache.release()
     assert storage._pool.num_free_blocks == blocks
-    print("[PASS] BF16 批量写入：非对齐追加、跨块单 Token、非连续块号，逐元素一致且块已归还")
 
 
 @torch.inference_mode()
@@ -190,16 +178,12 @@ def check_int8() -> None:
             torch.testing.assert_close(got_value.cpu(), vd.float() * vs.float(), rtol=0, atol=0)
             actual = _C.paged_decode_int8(q, *tensors, table, length)
             result = actual.cpu()
-            error = (result.double() - expected).abs().max().item()
-            print(f"[诊断] INT8 融合：Q头={q_heads}，KV头={kv_heads}，长度={length}，FP64参考误差={error:.8g}")
             torch.testing.assert_close(result.double(), expected, rtol=0.01, atol=0.002)
             if length == 1:
                 torch.testing.assert_close(result, v.to(torch.bfloat16), rtol=0, atol=0)
             if q_heads // kv_heads == 4:
                 # 4 倍 GQA 才走 V3：同一份量化数据、同一条 FP64 参考，覆盖长度 1/17/65 的空 warp 与尾段。
                 v3 = _C.paged_decode_int8(q, *tensors, table, length, v3=True).cpu()
-                print(f"[诊断] INT8 V3：Q头={q_heads}，长度={length}，"
-                      f"FP64参考误差={(v3.double() - expected).abs().max().item():.8g}")
                 torch.testing.assert_close(v3.double(), expected, rtol=0.01, atol=0.002)
             else:
                 # 非 4 倍配置由调用方留在 V1；V3 明确拒绝而不是静默换成 V1，免得把 V1 结果记成 V3。
@@ -220,8 +204,6 @@ def check_int8() -> None:
         finally:
             cache.release()
         assert storage._pool.num_free_blocks == blocks
-        print("[PASS] INT8 融合数值对照、非法输入拒绝和块归还通过")
-    print("[PASS] INT8批量Prefill写入与Decode追加六个场景通过")
 
 
 def main() -> None:
@@ -237,6 +219,7 @@ def main() -> None:
     else:
         check_bf16_write()
         check_int8()
+        print("[PASS] BF16分页写入与INT8六场景数值、边界及回收检查")
 
 
 if __name__ == "__main__":

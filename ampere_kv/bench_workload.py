@@ -382,7 +382,6 @@ def main():
             print(f"[流水] {sample['pipeline']}，Decode前向={sample['decode_forward_calls']}，最后输出秒={sample['last_output_s']:.6f}，输出后收尾ms={sample['completion_after_last_output_ms']:.3f}")
         for window in sample["windows"]:
             print(f"[窗口] {window['phase']} 输出吞吐={window['output_tokens_per_s']:.3f} Token/s，统计={window['counts']}")
-    print("[边界] Token按commit入口就绪、轮次按轮首分窗；分类可重叠，profile结果不作正式性能。")
     return int(result["status"] == "oom")
 
 

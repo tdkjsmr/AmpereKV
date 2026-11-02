@@ -44,19 +44,15 @@ def check_lifecycle(model, prompts, limits: tuple[int, ...]) -> None:
     # 容量取"r1 加上 r0 与 r2 中较大的预算"：r0 与 r1 都在跑时剩余空间必然小于 r2 的预算，
     # r2 一定要等；r0 一释放又必然不小于 r2。用例覆盖因此不依赖具体 Prompt 长度。
     capacity = max(budgets[0], budgets[2]) + budgets[1]
-    print(f"[观测] 输入 Token={tuple(p.shape[1] for p in prompts)}，每层预算={budgets}，每层容量={capacity} 块")
     requests, scheduler, held, peak_waiting, _ = _drive(model, prompts, limits, capacity, 1)
     for request, prompt, limit in zip(requests, prompts, limits):
         # 同一 BF16/V1 路径分别单独运行，作为交错调度的对照：Token 序列必须完全一致。
         alone = generate_tokens(model, prompt, max_new_tokens=limit, cache_kind="paged", cuda_decode=True)
         assert request.output_ids == alone, f"{request.request_id} 交错与独立不一致 {request.output_ids} != {alone}"
     assert peak_waiting > 0, "第三个请求从未等待，复用与容量用例没有覆盖"
-    print(f"[PASS] 交错执行与独立执行序列一致：三个请求分别生成 {limits} 个 Token")
-    print(f"[PASS] 提前完成互不影响：r0 停止原因={requests[0].stop_reason}，r1 仍完整生成 {limits[1]} 个")
     # 只要求有交集：块栈后进先出，r2 接入时先弹到 r0 刚归还的编号，但 r1 之后的增长也可能拿走
     # 其中某个块，所以"子集"太严格。证明没读到别人旧历史的是上面与独立运行一致。
     assert held["r2"] & held["r0"], f"r2 没复用到 r0 归还的块：{sorted(held['r2'])} ∩ {sorted(held['r0'])} 为空"
-    print(f"[PASS] 新请求复用归还的块：r2 用到 r0 的块编号 {sorted(held['r2'] & held['r0'])}")
     oversized = prompts[0].new_ones(1, capacity * PAGED_BLOCK_SIZE + 1)
     try:
         scheduler.submit("oversized", oversized, 1)
@@ -64,7 +60,6 @@ def check_lifecycle(model, prompts, limits: tuple[int, ...]) -> None:
         pass
     else:
         raise AssertionError("预算超过整层容量的请求未被拒绝")
-    print(f"[PASS] 容量与回收正确：每层 {capacity} 块，收尾预留额度归零、{len(scheduler.storages)} 层块全部归还")
 
 
 def check_batched(model, prompts, limits: tuple[int, ...], batch: int) -> None:
@@ -84,8 +79,6 @@ def check_batched(model, prompts, limits: tuple[int, ...], batch: int) -> None:
         want_batch = batched[index].output_ids
         assert alone == want_single == want_batch, (
             f"r{index} 三方不一致：单独={alone}，逐请求={want_single}，批量={want_batch}")
-    print(f"[PASS] 批量 Decode 与逐请求、单独运行三方一致：{len(prompts)} 个请求，历史长度 "
-          f"{tuple(p.shape[1] for p in prompts)}，生成上限 {limits}，最大成块 {batch}")
 
 
 def check_batched_operator(starts: tuple[int, ...] = (0, 16, 64)) -> None:
@@ -140,8 +133,6 @@ def check_batched_operator(starts: tuple[int, ...] = (0, 16, 64)) -> None:
         torch.testing.assert_close(storage._key[row[start // block], :, start % block],
                                    key[0, :, start], rtol=0, atol=0)
         assert torch.isnan(storage._key[row[tail // block], :, tail % block]).all(), f"r{index} 多写了一格"
-    print(f"[PASS] 批量算子对照：同组长度 {tuple(lengths)} 的数值、新写入位置与未写哨兵全部符合；"
-          "块表填充列用 -1，若被误读则断言失败")
 
 
 def main() -> None:

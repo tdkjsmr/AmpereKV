@@ -263,9 +263,6 @@ def evaluate(target, draft, scheduler, item, path, phase, index, report, expecte
         if row["difference"] is not None:
             print(f"[分歧] 输入={item['id']} 路径={path} 证据={row['difference']}")
             raise RuntimeError("完整输出不一致；该输入不生成性能结论，已保留原始样本与首处分歧")
-    if phase == "warmup":
-        print(f"[检查] 输入={item['id']} 路径={path} 输出=64 回收={row['recovered']} "
-              f"Graph={row.get('draft_graph', row.get('graph'))} 投机计数={row.get('speculative', {}).get('totals')}")
     return result["output_ids"]
 
 

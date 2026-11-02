@@ -316,23 +316,8 @@ def main():
         print(f"[时间线] {args.engine} B={args.batch} 预热后只采集一批；无性能样本")
     else:
         print(f"[证据] {args.engine} B={args.batch} 预热输出已保存；无计时样本，不报告性能")
-    print(f"[诊断] 预热请求数={len(warmup_outputs)}，每请求输出数={[len(ids) for ids in warmup_outputs]}；不属于计时样本")
-    if args.engine == "ampere":
-        print(f"[Graph] 请求={args.cuda_graph}，容量={engine_config['graph_max_tokens']}，"
-              f"块表宽度={engine_config['graph_table_width']}，捕获批量={engine_config['graph_captured_batches']}，"
-              f"初始化={engine_config['graph_initialization']}，预热计数={engine_config['graph_warmup_counts']}")
-        if times:
-            print(f"[Graph] 正式样本计数={[sample['graph_counts'] for sample in samples]}，"
-                  f"捕获总数={engine_config['graph_captures_after_measurement']}")
-        elif args.profile:
-            print(f"[Graph] 时间线批次计数={engine_config['graph_profile_counts']}")
     print(f"[指纹] 输入文件SHA256={file_hash}，选中Token SHA256={selected_hash}，提交={commit[:7]}")
-    if times:
-        print("[口径] 离线整批完成时间与输出吞吐")
-    elif args.profile:
-        print("[边界] 本次仅留 Nsight Systems 时间线与诊断输出，不报告无采样器的正式性能")
-    else:
-        print("[边界] 本次仅留预热输出证据，未执行性能测量")
+    print(f"[结果] {args.run_id} JSON={args.output}")
 
 
 if __name__ == "__main__":

@@ -286,7 +286,6 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS,
     current_input = input_ids
     if verify:
         reference_input, reference_cache, reference_ids = input_ids, None, []
-        print(f"缓存={cache_kind}，预留长度={capacity}，每层物理容量={caches[0].capacity}")
 
     for step in range(max_new_tokens):
         positions = torch.arange(used_tokens, used_tokens + current_input.shape[1], device=input_ids.device).unsqueeze(0)
@@ -314,19 +313,9 @@ def generate_tokens(model, input_ids, *, max_new_tokens: int = MAX_NEW_TOKENS,
         if verify:
             reference_input = torch.tensor([[reference_ids[-1]]], dtype=torch.long, device=input_ids.device)
 
-    if verify:
-        print(f"reference_token_ids = {reference_ids}")
-        print("[PASS] 逐步 logits、完整 Token 序列与缓存检查通过")
-        if cache_kind == "paged":
-            crossed = (used_tokens - 1) // PAGED_BLOCK_SIZE > (tokens - 1) // PAGED_BLOCK_SIZE
-            print(f"分页块大小={PAGED_BLOCK_SIZE}，Prefill 长度={tokens}，最终 KV 长度={used_tokens}，Decode 跨块={crossed}")
-            if not crossed:
-                print("[未覆盖] 本次 Decode 未跨块，需换输入补验；不能据此宣称跨块生成验证通过")
     if cache_kind == "paged":
         for cache in caches:
             cache.release()
-        if verify:
-            print("已归还全部层分页块；本入口不再重复检查块池内部标记")
     sampler.release()
     return generated_ids
 
@@ -361,7 +350,6 @@ def main() -> None:
     text = input("请输入一段文本：")
     if not text.strip():
         raise ValueError("输入不能为空")
-    print(f"正在从本地缓存加载固定版本 Qwen3-8B，模式={args.mode}，缓存={args.cache}……")
     model, tokenizer = load_model_and_tokenizer()
     input_ids = encode_prompt(tokenizer, text)
     if args.mode == "int8-check":
@@ -375,8 +363,6 @@ def main() -> None:
         check_cuda_decode(model, input_ids, v3=args.decode_kernel == "v3")
         return
     use_int8 = args.kv_dtype == "int8"
-    if args.mode == "generate":
-        print(f"生成路径：KV={args.kv_dtype}，Prefill=BF16 SDPA，Decode={'INT8 CUDA' if use_int8 else 'BF16 SDPA'}，Decode内核={args.decode_kernel}")
     generated_ids = generate_tokens(
         model, input_ids, verify=(args.mode == "check"), cache_kind=args.cache,
         cuda_decode=use_int8, kv_dtype=torch.int8 if use_int8 else torch.bfloat16,
@@ -388,11 +374,8 @@ def main() -> None:
     reason = "EOS" if generated_ids[-1] in eos_ids else "达到新 Token 上限"
     print(f"generated_token_ids = {generated_ids}")
     print(f"generated_text = {tokenizer.decode(generated_ids, skip_special_tokens=True)!r}")
-    print(f"停止原因={reason}，生成数={len(generated_ids)}，Decode 次数={len(generated_ids) - 1}")
-    if len(generated_ids) == 1:
-        print("首个 Token 为 EOS，本次未覆盖 Decode")
-    if args.mode == "generate":
-        print("生成完成")
+    if args.mode == "check":
+        print(f"[PASS] HF逐步logits、完整序列与缓存检查；输出={len(generated_ids)}，停止={reason}")
 
 
 if __name__ == "__main__":

@@ -171,7 +171,6 @@ def main() -> None:
             torch.testing.assert_close(actual_key, expected_key[:, :, :end], rtol=0, atol=0)
             torch.testing.assert_close(actual_value, (vd.float() * vs.float())[:, :, :end], rtol=0, atol=0)
             assert cache.length == end and tuple(t.data_ptr() for t in tensors) == addresses
-            print(f"[PASS] 分组K存储：长度={end}，整数与scale布局、FP32读回及地址一致")
         assert cache._table.block_ids == (1, 0)
     finally:
         cache.release()

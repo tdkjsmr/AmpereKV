@@ -25,7 +25,6 @@ def check_prefix():
     ]
     for proposals, predictions, remaining, ignore, output, accepted, matched in cases:
         assert select_prefix(proposals, predictions, remaining, {0}, ignore) == (output, accepted, matched)
-    print("[PASS] 全接受/首处及中间拒绝、额外与修正Token、EOS裁切和短剩余预算；接受计数不含额外Token")
 
 
 def check_truncate():
@@ -67,7 +66,6 @@ def check_truncate():
     finally:
         cache.release()
     assert storage._pool.num_free_blocks == 4
-    print("[PASS] 同块/跨块/块边界/零/不变截断，前缀不变、追加覆盖、尾块复用及地址/回收")
 
 
 def release(caches):
@@ -98,13 +96,9 @@ def check_draft_hf(draft, ids):
             current = ids.new_tensor([[expected.logits[0, -1].argmax().item()]])
     finally:
         release(caches)
-    print("[PASS] 0.6B缓存Prefill及三步Decode与其HF logits逐位一致，独立层数/RoPE/绑定权重与回收")
 
 
 def compare_logits(actual, expected, label):
-    difference = actual.float() - expected.float()
-    relative = difference.norm() / expected.float().norm().clamp_min(1e-12)
-    print(f"[观测] {label}：最大绝对误差={difference.abs().max().item():.7g}，相对L2={relative.item():.7g}")
     assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
     for row in range(actual.shape[1]):
         if actual[0, row].argmax().item() != expected[0, row].argmax().item():
@@ -117,20 +111,14 @@ def check_draft_cuda(draft, ids):
     initial = ids[:, :15]
     sets = [make_caches(draft, 48) for _ in range(2)]
     addresses = [[(c._key.data_ptr(), c._value.data_ptr()) for c in caches] for caches in sets]
-    maximum, relative, pairs = 0.0, 0.0, 0
 
     def step(current):
-        nonlocal maximum, relative, pairs
         values = [forward_tokens(draft, current, caches, cuda_decode=bool(i)) for i, caches in enumerate(sets)]
-        delta = values[1].float() - values[0].float()
-        maximum = max(maximum, delta.abs().max().item())
-        relative = max(relative, (delta.norm() / values[0].float().norm().clamp_min(1e-12)).item())
         assert all(torch.isfinite(value).all() for value in values)
         if values[0].argmax().item() != values[1].argmax().item():
             print(f"[分歧] 草稿同历史长度={sets[0][0].length} reference={candidates(values[0][0, -1])} "
                   f"cuda={candidates(values[1][0, -1])}")
             raise AssertionError("草稿reference/CUDA同历史选词分歧")
-        pairs += 1
         expected = sets[0][0].length
         assert all(c.length == expected for caches in sets for c in caches)
         for caches, pointers in zip(sets, addresses):
@@ -159,8 +147,6 @@ def check_draft_cuda(draft, ids):
     finally:
         for caches in sets:
             release(caches)
-    print(f"[观测] 草稿reference/CUDA同历史{pairs}步：最大绝对误差={maximum:.7g}，最大相对L2={relative:.7g}")
-    print("[PASS] 草稿Q16/KV8 V1：跨16/32边界、截断15后重放、有效前缀/地址/长度与回收")
 
 
 @torch.inference_mode()
@@ -229,7 +215,6 @@ def check_draft_graph(draft, ids, graph):
     assert graph.counts()["device_tokens"] - before["device_tokens"] == 4
     assert graph.counts()["repairs"] - before["repairs"] == 1
     assert all(c.length == 0 and c._pool.num_free_blocks == c._key.shape[0] for c in caches)
-    print("[PASS] 草稿CUDA eager/Graph logits与28层KV严格一致；首次/跨16和32/截断重放/设备四步/真实补算/地址与回收")
 
 
 @torch.inference_mode()
@@ -252,30 +237,28 @@ def check_verification(target, ids):
         finally:
             for caches in sets:
                 release(caches)
-    print("[PASS] 8B K2/K4多位置返回、末位置接口与同历史逐Token选词/位置一致")
 
 
 @torch.inference_mode()
 def ordinary(target, ids, limit, ignore_eos):
     caches = make_caches(target, ids.shape[1] + limit)
-    output, tops, current = [], [], ids
+    output, current = [], ids
     try:
         for _ in range(limit):
             logits = forward_tokens(target, current, caches)
             token = logits[0, -1].argmax().item()
             output.append(token)
-            tops.append(candidates(logits[0, -1]))
             if not ignore_eos and token in eos_ids(target):
                 break
             current = ids.new_tensor([[token]])
         assert all(cache.length == ids.shape[1] + len(output) - 1 for cache in caches)
     finally:
         release(caches)
-    return output, tops
+    return output
 
 
 def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="reference", draft_graph=None):
-    reference, tops = ordinary(target, ids, limit, ignore_eos)
+    reference = ordinary(target, ids, limit, ignore_eos)
     graph_addresses = (tuple((c._key.data_ptr(), c._value.data_ptr()) for c in draft_graph.caches)
                        if draft_backend == "graph" else None)
     for k, bound in ((2, limit), (4, limit), (4, 1), (4, 2)):
@@ -298,7 +281,7 @@ def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="re
                 position = event["output_start"] + index
                 if position >= len(reference) or token != reference[position]:
                     print(f"[分歧] K={k} 首个输出位置={position}，轮输入={event.get('input_ids')}，"
-                          f"目标普通={tops[position] if position < len(tops) else None}，"
+                          f"目标普通Token={reference[position] if position < len(reference) else None}，"
                           f"验证={candidates(logits[0, index])}，提交={token}")
                     raise AssertionError("投机/普通greedy分歧；先定位同历史数值与位置，不放宽")
 
@@ -315,10 +298,6 @@ def check_generation(target, draft, ids, limit, ignore_eos, *, draft_backend="re
             assert stats["captures"] == 1 and stats["capture_delta"] == 0
             assert stats["device_tokens"] == result["proposed"]
             assert stats["replays"] == result["draft_forwards"] - 1 == stats["device_tokens"] + stats["repairs"]
-            print(f"[Graph] 同池跨请求复用：{stats}")
-        print(f"[PASS] 草稿={draft_backend} K={k} 输出上限={bound}，完整序列={len(result['output_ids'])}Token与普通greedy一致，"
-              f"提议/接受={result['proposed']}/{result['accepted']}，验证轮={result['verification_rounds']}，"
-              f"接受长度={[r['accepted'] for r in result['rounds']]}，停止={result['stop_reason']}；两套KV/地址/回收通过")
 
 
 def main():

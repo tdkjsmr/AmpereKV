@@ -98,7 +98,6 @@ def check_masks(tokenizer, vocab, stops):
     empty.matcher = SimpleNamespace(fill_next_token_bitmask=lambda mask: mask.zero_())
     rejected(lambda: empty.mask(torch.zeros(vocab, device="cuda")))
     empty.release()
-    print(f"[PASS] 真实tokenizer/模型词表={len(actual_ids)}/{vocab}，非法最高分、少于K/单候选、EOS、独立状态与零合法项拒绝")
 
     stub = SimpleNamespace(config=SimpleNamespace(vocab_size=vocab), model=SimpleNamespace(layers=[]),
                            generation_config=SimpleNamespace(eos_token_id=stops))
@@ -111,7 +110,6 @@ def check_masks(tokenizer, vocab, stops):
         setattr(scheduler, field, previous)
     rejected(lambda: scheduler.submit("bad", prompt, 16, structured=grammar, ignore_eos=True))
     assert not scheduler.waiting and not scheduler._submitted
-    print("[PASS] 可选依赖不影响普通导入；结构化流水/mixed/分块/ignore_eos在提交边界拒绝")
 
 
 def check_cuda_masks(tokenizer, vocab, stops):
@@ -122,7 +120,6 @@ def check_cuda_masks(tokenizer, vocab, stops):
              ({"type": "string", "enum": ["A", "B"]}, '"', "few"),
              ({"type": "string"}, '"', "many"))
     generator = torch.Generator(device="cuda").manual_seed(91)
-    totals = dict(samples=0, boundary=0, max_cdf_abs=0.0)
     for schema, prefix, kind in cases:
         grammar = (SchemaCompiler(tokenizer, vocab, stops[:1]) if kind == "eos" else compiler).compile(schema)
         for batch in (1, 4):
@@ -149,9 +146,6 @@ def check_cuda_masks(tokenizer, vocab, stops):
                             uniforms = torch.stack([cumulative_probabilities(distribution(row, 0.8, k)[1])[0]
                                                     for row in masked]).clamp_max(1 - 2**-24).contiguous()
                         _, expected, stats = check_sampling(masked, temperatures, uniforms, k)
-                        totals["samples"] += stats["samples"]
-                        totals["boundary"] += stats["boundary"]
-                        totals["max_cdf_abs"] = max(totals["max_cdf_abs"], stats["max_cdf_abs"])
                         requests = [SimpleNamespace(output_ids=[], sampler=RequestSampler(
                             1, vocab, "cuda", temperature=0.8, top_k=k, seed=42 + i,
                             sampling_backend="cuda", structured=state)) for i, state in enumerate(states)]
@@ -204,8 +198,6 @@ def check_cuda_masks(tokenizer, vocab, stops):
                     wrapper.stop()
         for request in requests:
             request.sampler.release()
-    print(f"[PASS] 结构化B1/B4、K40/128、FP32/BF16候选/CDF、单项/少于K/多于K、同分与EOS；统计={totals}")
-    print("[PASS] 批量CUDA实际命中；greedy/异构回退每行掩码一次，选词不推进matcher")
 
 
 class AuditedScheduler(Scheduler):
@@ -308,7 +300,6 @@ def check_model_path(model, tokenizer, path):
             text = tokenizer.decode(request.output_ids, skip_special_tokens=True)
             assert request.structured_complete and request.stop_reason == "EOS"
             validate(text, schema)
-            print(f"[JSON] 路径={path} 轮次={repeat} 请求={request.request_id} 输出={text} 停止={request.stop_reason} Token数={len(request.output_ids)}")
         assert len(requests[3].output_ids) == 6 and requests[3].stop_reason == "达到生成上限"
         output = [list(r.output_ids) for r in requests]
         if baseline is not None:
@@ -317,14 +308,11 @@ def check_model_path(model, tokenizer, path):
         if path != "eager-reference":
             assert scheduler.graph_calls > 0 and scheduler.graph_fallbacks > 0
             assert scheduler.fresh_logits == scheduler.graph_calls
-        print(f"[路径] {path} 批量={sorted(set(scheduler.batches))} Graph={scheduler.graph_calls} 回退={scheduler.graph_fallbacks}")
-    print(f"[PASS] {path} 两Schema/普通请求、greedy/随机、掩码与提交各一次、完整JSON、同配置复现与回收")
 
     scheduler = make_scheduler(1)
     short = scheduler.submit("short", prompts[0], 1, structured=category)
     finish(scheduler, [short])
     assert not short.structured_complete and short.stop_reason == "达到生成上限（结构化截断）"
-    print(f"[截断] 输出={tokenizer.decode(short.output_ids, skip_special_tokens=True)!r}，停止={short.stop_reason}，不补括号")
 
     scheduler = make_scheduler(1)
     neighbor = scheduler.submit("neighbor", prompts[2], 8, ignore_eos=True)
@@ -351,7 +339,6 @@ def check_model_path(model, tokenizer, path):
     assert len(neighbor.output_ids) == 8 and neighbor.stop_reason == "达到生成上限"
     assert final.structured_complete
     validate(tokenizer.decode(final.output_ids, skip_special_tokens=True), APPROVAL)
-    print(f"[PASS] {path} 等待/生成取消、等待/活动到期、替换复用、邻居完成及全部matcher/块回收")
 
     # 先分别Prefill，再同轮启动四条Decode，避免自然短输出在准入期间提前退场。
     scheduler = make_scheduler()
@@ -377,7 +364,6 @@ def check_model_path(model, tokenizer, path):
     finish(scheduler, requests)
     assert requests[-1].structured_complete
     validate(tokenizer.decode(requests[-1].output_ids, skip_special_tokens=True), CATEGORY)
-    print(f"[PASS] {path} B4→B3→B2→B1；取消所属状态释放、邻居JSON完成，Graph按既有批次命中/回退")
 
 
 def main():

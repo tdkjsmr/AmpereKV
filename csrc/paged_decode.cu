@@ -111,11 +111,7 @@ __global__ void bf16_write_kernel(
 }
 
 // 一个线程块的四个 warp 分别处理段内不同 Token；每线程负责连续四维，用打包载入一次取回。
-// 不创建连续历史副本，不展开 GQA 的 K/V，不使用 Tensor Core 或异步搬运。
-// 只实例化 BF16 与 INT8 两种读取方式，归约和分段合并共用；不是通用类型派发框架。
-// V1 的收益在依赖链而不在带宽：本长度下每 SM 只有 1~25 个 warp，掩盖不了流水线气泡，
-// 所以缩短 load→scale→乘→累加 的链长比少读字节更关键；INT8 的 K scale 广播已由四次减为一次。
-// 本内核保持 V1 原样作为 A/B 基线，四头共享载入见下方的 paged_decode_v3_kernel。
+// BF16 与 INT8 共用归约和分段合并；INT8 每连续四维只需一次 K scale 广播。
 template <typename KV>
 __global__ void paged_decode_kernel(
     const c10::BFloat16* query, const KV* key,
@@ -700,7 +696,7 @@ void bf16_write_cuda(const at::Tensor& key, const at::Tensor& value,
 }
 
 // 受检查入口：供独立算子检查与外部调用；非法块号同步报错，调用方可捕获后继续。
-// v3 默认 false，即仍走 V1；V3 只是实验选择，未测量前不替换默认路径。
+// 默认使用 V1；v3 显式选择同组四头共享载入。
 at::Tensor paged_decode_cuda(const at::Tensor& query, const at::Tensor& key,
                             const at::Tensor& value, const at::Tensor& table, int64_t length, bool v3) {
   return paged_decode_impl(query, key, value, table, length, false, true, at::Tensor(), at::Tensor(), v3);

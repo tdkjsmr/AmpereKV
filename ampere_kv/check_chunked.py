@@ -25,7 +25,6 @@ def check_mask():
         actual = sdpa_attention(query[:, :, start:end], key[:, :, :end], value[:, :, :end],
                                 history=start, causal=True)
         torch.testing.assert_close(actual.double(), expected[:, :, start:end], rtol=1e-5, atol=1e-5)
-    print("[PASS] 偏移因果掩码对独立公式通过：17/47/1 Token，含 GQA 与单 Token 尾块")
 
 
 @torch.inference_mode()
@@ -61,11 +60,10 @@ def check_read_back():
         assert torch.isnan(storage._key[tail_block, :, tail_offset + 1:]).all(), "尾块未写部分被写过"
     finally:
         cache.release()
-    print("[PASS] BF16 批量读回：非连续块表、部分尾块、独立副本与 locate 逐位置参考一致")
 
 
 def check_model(model, prompt, chunk=128):
-    """整段/分块各自完成 Prefill 和短 Decode；logits 报误差，不预设跨形状逐位一致。"""
+    """整段/分块各自完成Prefill和短Decode，核对有限值与同历史选词。"""
     length, new_tokens = prompt.shape[1], 8
     blocks = (length + new_tokens + 15) // 16
     cache_sets, logits = [], []
@@ -87,11 +85,7 @@ def check_model(model, prompt, chunk=128):
         for step in range(new_tokens):
             reference, actual = (tensor.float() for tensor in logits)
             assert torch.isfinite(reference).all() and torch.isfinite(actual).all()
-            difference = actual - reference
-            relative = difference.norm() / reference.norm().clamp_min(1e-12)
             ids = [tensor.argmax(-1).item() for tensor in logits]
-            print(f"[观测] 输出{step + 1}：logits最大误差={difference.abs().max().item():.6g}，"
-                  f"相对L2={relative.item():.6g}，整段/分块Token={ids}")
             assert ids[0] == ids[1], "整段/分块选词分歧，先定位；不自动放宽验收"
             for sequence, token in zip(sequences, ids):
                 sequence.append(token)
@@ -100,7 +94,6 @@ def check_model(model, prompt, chunk=128):
                 logits = [model_forward(model, prompt.new_tensor([[token]]), position, caches,
                                         is_prefill=False, cuda_decode=True)
                           for token, caches in zip(ids, cache_sets)]
-        print("[PASS] 整段/分块序列一致：固定生成8个Token，忽略EOS")
         return sequences[1]
     finally:
         for caches in cache_sets:
@@ -129,7 +122,6 @@ def check_interleaved(model, prompt, expected, chunk=128):
                                                cache_kind="paged", cuda_decode=True, ignore_eos=True)
     assert scheduler.reserved_blocks == 0
     assert all(storage._pool.num_free_blocks == 32 for storage in scheduler.storages)
-    print("[PASS] 分块期间 Decode 持续推进、未提前选词、交错序列与独立一致，全部块归还")
 
 
 def check_graph_chunked(model, prompt):
@@ -230,11 +222,8 @@ def check_graph_chunked(model, prompt):
         assert all(len(r.output_ids) == r.max_new_tokens and r.stop_reason == "达到生成上限" for r in completed)
         assert eager.reserved_blocks == graph.reserved_blocks == 0
         assert all(s._pool.num_free_blocks == capacity for s in eager.storages + graph.storages)
-        print(f"[PASS] Chunk256+Graph 输入={length}，中途取消={cancel}：同组批logits/KV严格一致，"
-              "中间块不选词、邻座持续Decode、退出与回收通过")
     assert graph.graph_fallbacks == 0 and graph.graph_captures == 4
     assert all(g.replays > 0 for g in graph.graphs.values())
-    print(f"[PASS] 分块组合真实Graph重放={ {b: g.replays for b, g in graph.graphs.items()} }")
 
 
 def check_stop(model, long_prompt, short_prompt, chunk=64):
@@ -305,8 +294,6 @@ def check_stop(model, long_prompt, short_prompt, chunk=64):
     scheduler.step()
     assert scheduler.reserved_blocks == 0 and not scheduler.waiting and not scheduler.running
     assert all(storage._pool.num_free_blocks == capacity for storage in scheduler.storages)
-    print(f"[PASS] 合作式取消/到期：等待、Prefill、Decode 三处各停一次，到期不覆盖取消原因，"
-          f"复用归还块，邻座序列与单独运行一致，收尾额度 0 且每层 {capacity} 块全部归还")
 
 
 def main():
@@ -315,13 +302,10 @@ def main():
     model, tokenizer = load_model_and_tokenizer()
     ids = encode_prompt(tokenizer, "用一句话解释 KV 缓存。")
     prompt = ids.repeat(1, (257 + ids.shape[1] - 1) // ids.shape[1])[:, :257]
-    print("[配置] BF16/V1；输入257 Token，Chunk=128，尾块1 Token")
     expected = check_model(model, prompt)
     check_interleaved(model, prompt, expected)
-    print("[配置] 合作式停止用例：长请求 257 Token 按 Chunk=64 分块，短请求单独一条作对照")
     check_stop(model, prompt, ids)
     long_prompt = ids.repeat(1, (512 + ids.shape[1] - 1) // ids.shape[1])[:, :512]
-    print("[配置] Chunk=256；512输入分两块，257输入含单Token尾块；Graph显式B1至B4")
     check_model(model, long_prompt[:, :257], chunk=256)
     check_graph_chunked(model, long_prompt)
     print("[完成] 固定 Chunk、交错调度与合作式取消/到期检查通过")

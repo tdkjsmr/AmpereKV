@@ -43,7 +43,6 @@ def check_probabilities(device):
     assert sample_uniform(tied, 1.0, -1, torch.tensor(0.25, device=device)).item() == 1
     assert sample_uniform(tied, 1.0, 2, torch.tensor(0.5, device=device)).item() == 1
     assert sample_uniform(tied, 1.0, 1, torch.tensor(0.99, device=device)).item() == tied.argmax().item() == 0
-    print("[PASS] 独立FP64概率/逆CDF参考、温度/top-k/全词表、同分边界与极端有限logits")
 
 
 def check_positions(device):
@@ -99,7 +98,6 @@ def check_positions(device):
             raise AssertionError(f"未拒绝非法参数：{invalid}")
     state.release()
     assert state.uniforms is None
-    print("[PASS] 请求私有uniform/全局RNG不变、seed复现、行重排/插入退出、位置0/1与前瞻丢弃重取")
 
 
 def boundary_intervals(left, right, uniform, a, b):
@@ -187,7 +185,6 @@ def check_zero_tail(device, vocab=None):
             assert (actual[0, count - 1:] == 1).all()
             for u in probes:
                 check_candidates(values, ids, t, u[None])
-    print(f"[PASS] {'CUDA与参考' if vocab is not None else '参考'}38/41项零尾部、实际总量归一化与近1选词")
 
 
 @contextmanager
@@ -257,7 +254,6 @@ def check_cuda():
     vocab = AutoConfig.from_pretrained(MODEL_ID, revision=MODEL_REVISION, local_files_only=True).vocab_size
     check_zero_tail("cuda", vocab)
     generator = torch.Generator(device="cuda").manual_seed(99)
-    summary = {name: dict(samples=0, boundary=0, max_cdf_abs=0.0) for name in ("random", "boundary")}
     for batch in (1, 4):
         for k in (40, 128):
             for dtype in (torch.float32, torch.bfloat16):
@@ -301,9 +297,6 @@ def check_cuda():
                                 raise AssertionError((batch, k, dtype, size, kind, name, u.tolist())) from error
                             cuda_candidates(values, ids, temperatures, u, out)
                             assert torch.equal(tokens, out), "同后端重复选词不同"
-                            for key in ("samples", "boundary"):
-                                summary[name][key] += stats[key]
-                            summary[name]["max_cdf_abs"] = max(summary[name]["max_cdf_abs"], stats["max_cdf_abs"])
                         assert torch.equal(cuda_topk(x, k)[1], ids)
     for bad in (torch.zeros(1, 127, device="cuda"), torch.zeros(1, 256, device="cuda", dtype=torch.float16)):
         try:
@@ -325,8 +318,6 @@ def check_cuda():
         states[0].temperature = 0
         assert torch.equal(sample_batch(x, requests), torch.stack([r.sampler.sample(row, 0, sampling_backend="reference")
                                                                   for row, r in zip(x, requests)]))
-    print("[PASS] CUDA候选、概率/CDF边界、尾部/同分与请求位置检查通过")
-    print(f"[汇总] 普通随机数与主动边界样本分开统计：{summary}")
 
 
 def check_model(sampling_backend="reference"):
@@ -393,10 +384,7 @@ def check_model(sampling_backend="reference"):
                 assert requests[0].stop_reason == "EOS" and len(requests[0].output_ids) == 3
                 if mode == "c":
                     assert s.decode_pipeline.stats["discarded_tokens"] >= 1
-            k_label = top_k if sampling_backend == "cuda" else "逐请求"
-            print(f"[PASS] 采样后端={backend} 路径={mode} K={k_label} 历史={lengths}：输出/停止/KV及释放；批量={sorted(batches)}")
     check_stop_and_reuse(model, scheduler_type=make_scheduler)
-    print("[完成] 请求级采样与模型集成检查通过")
 
 
 def main():
@@ -412,6 +400,7 @@ def main():
         check_zero_tail("cuda")
     if args.model:
         check_model(args.sampling_backend)
+    print("[PASS] 请求随机流、概率/CDF与采样检查")
 
 
 if __name__ == "__main__":

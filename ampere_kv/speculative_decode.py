@@ -31,9 +31,6 @@ def load_pair():
         raise ValueError("目标与草稿的模型词表大小或EOS配置不一致")
     if draft.config.tie_word_embeddings and draft.lm_head.weight.data_ptr() != draft.model.embed_tokens.weight.data_ptr():
         raise ValueError("草稿模型的Embedding与LM Head未按配置绑定")
-    print(f"[模型] 目标={MODEL_ID}@{MODEL_REVISION}，草稿={DRAFT_ID}@{DRAFT_REVISION}")
-    print(f"[配置] 草稿层={draft.config.num_hidden_layers}，Q/KV头="
-          f"{draft.config.num_attention_heads}/{draft.config.num_key_value_heads}；词表及特殊Token一致，使用目标输入模板")
     return target, draft, tokenizer
 
 
@@ -217,9 +214,6 @@ def main():
                                   draft_backend=args.draft_backend, draft_graph=graph)
     print(f"generated_token_ids = {result['output_ids']}")
     print(f"generated_text = {tokenizer.decode(result['output_ids'], skip_special_tokens=True)!r}")
-    print(f"[统计] 草稿={result['draft_backend']}，输入={ids.shape[1]}，K={args.draft_tokens}，输出={len(result['output_ids'])}，"
-          f"提议={result['proposed']}，接受={result['accepted']}，验证轮={result['verification_rounds']}，"
-          f"接受长度={[r['accepted'] for r in result['rounds']]}，停止={result['stop_reason']}，回收={result['recovered']}")
 
 
 if __name__ == "__main__":

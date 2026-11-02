@@ -115,9 +115,6 @@ def compare(model, lengths, limits, *, force_eos=False, natural_eos=False, capac
             assert requests[0].stop_reason == "EOS" and len(requests[0].output_ids) == 3
             if mode == "c":
                 assert s.decode_pipeline.stats["discarded_tokens"] >= 1
-        print(f"[PASS] 路径={mode} 历史={lengths} 上限={limits}：输出/停止与A一致，块全归还；批量={sorted(batches)}")
-        if mode != "a":
-            print(f"[流水] {dict(s.decode_pipeline.stats)}")
 
 
 def check_stop_and_reuse(model, scheduler_type=CheckedScheduler):
@@ -157,7 +154,6 @@ def check_stop_and_reuse(model, scheduler_type=CheckedScheduler):
         assert seen & held, "未复用归还的旧块"
         assert len(requests[3].output_ids) == 12 and len(replacement.output_ids) == 5
         finish(s, requests)
-        print(f"[PASS] {mode}：取消/到期优先级、在途丢弃后安全回收、替换请求块复用和邻座完成")
 
 
 def main():
@@ -176,7 +172,6 @@ def main():
     s.decode_pipeline.drain()
     assert s.decode_pipeline.pending is None and len(requests[0].output_ids) == before + 1
     finish(s, requests)
-    print("[PASS] 显式drain提交最后在途结果，随后可重入；跨块、序列及缓冲轮换已覆盖")
     print("[完成] 单步流水正确性检查通过")
 
 

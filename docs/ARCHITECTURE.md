@@ -31,7 +31,7 @@ AmpereKV 在单张 CUDA GPU 上运行 Qwen3-8B。线性层、Embedding、RMSNorm
 
 `scheduler.py`按FIFO维护waiting、唯一prefilling槽位、running和finished。每轮先在轮首处理取消/到期，再Decode、回收、推进一个Prefill块；末块才选首Token并转入running。预留额度覆盖请求后续增长，不能用当前空闲块数代替。`_retire()`统一释放采样状态、KV和预算。
 
-Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；开发分支可用`enable_graphs(max_tokens, batches=(1, 2, 3, 4))`增加真实B2/B3。容量须16对齐；其他批量或超容量回退eager。静态输入/输出和元数据由图持有，每步重写位置与各层块表；返回logits会被下一次重放覆盖。
+Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；可用`enable_graphs(max_tokens, batches=(1, 2, 3, 4))`增加真实B2/B3。容量须16对齐；其他批量或超容量回退eager。静态输入/输出和元数据由图持有，每步重写位置与各层块表；返回logits会被下一次重放覆盖。
 
 `prefill_chunk_size=0`保持整段，正值每轮推进一块。后续块使用`j ≤ history+i`偏移因果掩码；Prefill不进Graph。混合前向共用投影和MLP，Attention仍按请求独立，与Graph分开启用。配置与接口见[README](../README.MD)，取舍见[动态负载报告](BENCHMARK.md#动态到达负载与分块取舍)。
 
@@ -49,7 +49,7 @@ Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；开发分支可
 
 内部最多两轮在途、返回时最多一轮。槽位持有至事件完成，旧设备Token消费后才能覆盖。`cache.length`表示已登记执行长度，CPU已提交有效长度为`P+len(output_ids)-1`。B2/B3、等待准入、身份变化或容量边界先排空，再走同步调度。EOS/取消/到期丢弃对应在途结果，设备引用结束后退休；停止只在轮首生效，Prefill保持同步。
 
-设计参考DeepInfer的设备Token接续及current-forward / previous-post方式，来源与时间线见[单步流水报告](BENCHMARK.md#di-02受限单步流水消融f5d5c33)。
+设计参考DeepInfer的设备Token接续及current-forward / previous-post方式，来源与时间线见[流水报告](BENCHMARK.md#单步流水)。
 
 ## 请求级采样
 
@@ -61,7 +61,13 @@ Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；开发分支可
 
 来源：DeepInfer的[请求参数](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/sampling_params.py)、[采样层](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py)、[候选缩减/融合划分](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/layers/sampler_utils.py)，以及[DeepSelect的大词表小K场景](https://github.com/deepseek-ai/DeepSelect/tree/bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18)。请求随机流、逆CDF和CUDA内核由本项目实现。
 
-检查保留候选ID/分数精确对照，概率rtol=2e-6、atol=1e-7，CDF独立FP64及两侧绝对误差上限1e-6。各自选词须符合各自CDF；跨后端差异只接受uniform落在实际移动分界区间内，不修改生产随机数。模型首次分叉诊断在计时外。
+## 投机解码
+
+`speculative_decode.py`独立驱动8B目标与0.6B草稿，保持各自层数、权重、RoPE和KV池。轮首KV不含最后一个已提交Token（pending）；草稿用pending连续提议K个候选，目标一次输入pending和候选，返回K+1个预测位置。
+
+提交最长匹配前缀及一个目标修正/额外Token，按EOS和剩余预算裁切。两套KV截断到实际提交长度；全接受时，草稿需真实补算最后一个尚未写入KV的候选。最后提交的Token继续作为下一轮pending。
+
+`speculative_draft.DraftGraph`组合既有B1 Graph，独占28层固定池。GPU argmax在图外同流执行，各候选写独立槽，下一步直接读取设备Token；目标验证后一次取回候选与预测。最多四个起草上传槽和一个补算槽，统一取词完成后再复用；结束等待当前流并归还逻辑块，物理池和图跨请求常驻。reference/cuda后端沿用相同接受与回收逻辑。
 
 ## 结构化输出与检查入口
 
