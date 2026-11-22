@@ -6,24 +6,24 @@ AmpereKV 是面向 Qwen3-8B、单张 RTX 3090（`sm_86`）的轻量文本推理�
 
 - **推理与调度**：BF16 Prefill、贪心生成、连续/分页 KV、连续批处理、分块 Prefill、混合前向，以及请求取消和到期回收。
 - **CUDA Decode**：直接读取分页 KV，支持等头数和 GQA；调度器默认使用 BF16/V1，单请求 BF16 生成默认使用 SDPA。
-- **CUDA Graph**：BF16/V1 Decode默认捕获B1/B4；可显式增加B2/B3，其他批量或超容量回退eager。
+- **CUDA Graph** 批量重放 BF16/V1 Decode，批量或序列长度超出捕获范围时回退 eager。
 - **INT8 KV**：K 每 32 维一组 scale，V 每 Token、每 KV 头一个 scale；计入 scale 后，同容量 KV 存储比 BF16 减少约 48%。
 - **异步流水**：设备端 Token 接续、双缓冲和单步前瞻，提供同步与重叠两种执行方式。
 - **投机解码**：Qwen3-0.6B 草稿与 Qwen3-8B 目标，K2/K4、BF16 greedy；草稿支持 reference/CUDA/Graph，Graph 使用设备 Token 连续起草。
 - **请求级采样**：temperature、top-k 和独立 seed，兼容同步与异步 Decode。
 
-分页块大小为16 Token，每请求独占已分配块。支持组合集中如下：
+分页块大小为 16 Token。每个请求持有独立块表，并独占分配给它的物理块。
 
 | 入口 | 支持范围 |
 |---|---|
 | 单请求生成 | BF16连续/分页KV；INT8使用分页CUDA Decode，权重仍为BF16 |
-| 同步调度 | BF16/V1，整段或分块Prefill；Graph默认B1/B4，可显式B1至B4 |
+| 同步调度 | BF16/V1，整段或分块 Prefill。启用 Graph 时默认捕获 B1，批量上限至少为 4 时默认再捕获 B4。可在批量上限内显式选择 B1 至 B4 |
 | 混合前向 | BF16、greedy；与Graph分开启用 |
 | 异步流水 | BF16/V1、B1/B4 Graph；普通请求，可用随机采样 |
 | 投机解码 | 单请求BF16 greedy，K2/K4，独立于多请求调度器 |
 | JSON Schema | BF16/V1、整段Prefill、同步eager/Graph、正常EOS；reference/CUDA采样 |
 
-Graph容量须16对齐并覆盖历史；首次提交前捕获。模型前向在图内，选词与语法过滤在图外。
+在提交首个请求前捕获 Graph。将捕获容量按 16 Token 对齐，使它覆盖预期的 Decode 历史。Graph 执行模型前向，选词与语法过滤在图外执行。
 
 ## 安装与运行
 
@@ -48,17 +48,17 @@ make smoke
 python -m ampere_kv.runner --mode generate --cache paged
 ```
 
-已有固定 Revision 缓存时可跳过下载。生成命令会询问一段文本；模型和分词器从 `HF_HOME` 的本地缓存加载。其他模式见 `python -m ampere_kv.runner --help`。
+生成命令读取一段文本，并从 `HF_HOME` 加载固定版本的模型和分词器。已有该版本缓存时可跳过下载。使用 `python -m ampere_kv.runner --help` 查看其他模式。
 
 ### 异步流水与随机采样
 
-完成环境准备后，可运行请求级随机采样：
+以下命令以温度 0.8、40 个候选和固定种子生成文本。
 
 ```bash
 python -m ampere_kv.runner --mode generate --cache paged --temperature 0.8 --top-k 40 --seed 42
 ```
 
-默认 `temperature=0` 为贪心生成。`top_k=-1` 使用全词表，其余取值为 `1..vocab_size`；seed 为 `0..2^32-1`，省略时自动生成并由 runner 打印。调度器使用 `submit(..., temperature=0.8, top_k=40, seed=42)`。固定环境和采样后端下，相同 logits、参数、seed 和输出位置可复现；不同后端可能在累计概率（CDF）分界附近选中不同候选。
+默认 `temperature=0` 使用贪心生成。`top_k` 取 `1..vocab_size`，或用 `-1` 选择全词表。随机采样的种子范围为 `0..2^32-1`。省略种子时，runner 生成并打印种子。调度器可通过 `submit(..., temperature=0.8, top_k=40, seed=42)` 设置同一组参数。复现采样序列时固定 logits、参数、种子、输出位置、环境和采样后端。
 
 默认采样后端为 `reference`。在生成命令添加 `--sampling-backend cuda`，或在 `submit()` 传入 `sampling_backend="cuda"`，选择分段 Top-K 与小候选融合采样。快路径支持 B1/B4、K40/128、FP32/BF16、V≤524288；异构 K 或混合 greedy 走参考。用 `python -m ampere_kv.check_sampler --sampling-backend cuda --model` 检查，`python -m ampere_kv.bench_sampler` 运行配对微基准。
 
@@ -90,7 +90,7 @@ with torch.inference_mode():
 print(tokenizer.decode(request.output_ids, skip_special_tokens=True), request.stop_reason)
 ```
 
-编译结果可复用，每请求独占matcher与掩码，允许不同Schema和普通请求共存。从首Token起过滤，EOS表示语法完整结束；达到输出上限时报告“结构化截断”。普通请求无需安装XGrammar。
+同一份语法编译结果可供多个请求使用，每个请求独占 matcher 和掩码。不同 Schema 的请求可以与普通请求同批运行。从首个 Token 开始过滤候选，EOS 表示语法完整结束，达到输出上限时报告“结构化截断”。XGrammar 仅用于结构化请求。
 
 配对入口为 `python -m ampere_kv.bench_structured_output --output /absolute/path/structured.json --run-id structured-01`；配置、原始样本与结果见[同步结构化输出报告](docs/BENCHMARK.md#同步结构化输出6ea7014)。
 
@@ -105,13 +105,13 @@ python -m ampere_kv.bench_arrivals --input /absolute/path/inputs.json \
   --scenarios steady burst --rate 2.128913764807336
 ```
 
-输入为四条512 Token模板，每请求固定32输出。默认4请求预热、16请求闭环校准，显式`--rate`固定正式到达率；窗口60秒、排空上限120秒。`--scenarios`、`--seconds`、`--repeats`选择场景、时长和重复；每场最多256请求，KV池预算8请求，`--max-batch`限制一次Decode组大小。
+基准使用这四条模板，每请求固定生成 32 个 Token。默认用 4 个请求预热，再用 16 个请求做闭环校准。显式传入 `--rate` 可固定正式到达率。默认测量窗口为 60 秒，排空上限为 120 秒。使用 `--scenarios`、`--seconds`、`--repeats` 调整场景、时长和重复次数。每场最多 256 个请求，KV 池按 8 个请求预留，`--max-batch` 控制每次 Decode 最多合批多少请求。
 
 `--prefill-chunk-size 256`选择分块，默认0为整段。Graph省略集合时仍捕获B1/B4，显式集合对应`enable_graphs(capacity, batches=(1, 2, 3, 4))`。组合检查运行`python -m ampere_kv.check_chunked`。延迟、吞吐、排空口径和配对取舍见[动态到达报告](docs/BENCHMARK.md#动态到达负载与分块取舍)。
 
 时间线入口为`python -m ampere_kv.profile_arrivals --input /absolute/path/inputs.json --output /absolute/path/profile.json --run-id profile-01`：默认8秒steady；`--no-record`关闭标记，`--capture`采集预热后的目标批次，`--mode insert`运行固定轮次插入对照。
 
-## 阅读与测试
+## 投机解码
 
 先缓存[固定草稿版本](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca)，再显式选择草稿后端生成：
 
@@ -120,16 +120,18 @@ hf download Qwen/Qwen3-0.6B --revision c1899de289a04d12100db370d81485cdf75e47ca
 python -m ampere_kv.speculative_decode --draft-backend graph --draft-tokens 4 --prompt hi
 ```
 
-两模型共用目标对话模板；草稿后端省略时保持reference，`cuda`用于无图消融。K仅2/4、输出上限64，默认遇EOS停止。Graph候选保留在设备，目标一次验证多位置，按实际接受长度截断并补齐KV。多Token验证与逐Token路径可能在BF16近同分处选词不同，已记录该案例。
+两模型共用目标对话模板。草稿默认使用 `reference`，可通过 `cuda` 测量逐步 CUDA Decode，或通过 `graph` 使用设备端连续起草。K 取 2 或 4，最多生成 64 个 Token，默认遇 EOS 停止。目标模型一次验证多个位置，并按实际提交长度更新两套 KV。多 Token 验证与逐 Token 前向在 BF16 近同分处可能选出不同的 Token。
 
-基础生成与投机检查：
+运行以下命令检查与 Hugging Face 逐步生成的一致性，以及投机解码的跨块续写、截断和缓存回收。
 
 ```bash
 python -m ampere_kv.runner --mode check --cache paged
 python -m ampere_kv.check_speculative_decode --model --draft-backend graph --prompt hi --max-new-tokens 64
 ```
 
-六路径基准使用`bench_speculative_decode --compare-graph --mode smoke|paired`，paired测固定cpp/python两输入、64输出、每路径三次样本，初始化在计时外。完整命令与原始样本见[投机解码报告](docs/BENCHMARK.md#投机解码)。
+使用 `bench_speculative_decode --compare-graph` 比较六条执行路径。`--mode smoke` 运行冒烟检查，`--mode paired` 对固定 cpp 和 python 输入分别测量。每条路径测三次，每次生成 64 个 Token。完整命令、计时范围和原始样本见[投机解码报告](docs/BENCHMARK.md#投机解码)。
+
+## 阅读与测试
 
 执行主线：`runner.py`（模型前向）→ `scheduler.py`（调度）→ `paged_cache.py`（缓存）→ `graph_decode.py`（Graph）。`async_decode.py` 管理跨轮流水，`sampler.py` 管理请求级采样。
 

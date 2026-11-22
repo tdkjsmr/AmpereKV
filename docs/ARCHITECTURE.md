@@ -23,17 +23,17 @@ AmpereKV 在单张 CUDA GPU 上运行 Qwen3-8B。线性层、Embedding、RMSNorm
 
 `runner.py` 负责模型加载、生成循环和逐层前向。Prefill 输入 Prompt，写入 RoPE 后的 K 和未旋转的 V；后续 Decode 输入上次选出的 Token，并使用其绝对位置和已有 KV。分块 Prefill 的后续块读取已有历史。
 
-`kv_cache.py` 提供连续缓存与 SDPA 参考路径。`paged_cache.py` 管理分页物理存储、写入与逻辑读回，`block_pool.py` 管理块编号及位置映射。每层共享一份 `PagedKVStorage`，各请求持有独立块表并独占已分配块。`_retire()` 统一回收请求资源。
+`kv_cache.py` 提供连续缓存与 SDPA 参考路径。`paged_cache.py` 管理分页物理存储、写入与逻辑读回，`block_pool.py` 管理块编号及位置映射。调度器为每层建立一份共享的 `PagedKVStorage`，各请求用独立块表把逻辑位置映射到自己持有的物理块。
 
 单请求 BF16 生成默认使用 SDPA Decode，调度器使用 BF16/V1 CUDA Decode。V1 每个线程块处理一个 Query 头，V3 由同一 GQA 组的四个 Query 头共享 K/V 加载。INT8 缓存存储量化 K/V 和 scale，模型权重保持 BF16。扩展绑定在 `csrc/bindings.cpp`，内核在 `csrc/paged_decode.cu`，编译目标为 `sm_86`。
 
 ## 调度与 Graph
 
-`scheduler.py`按FIFO维护waiting、唯一prefilling槽位、running和finished。每轮先在轮首处理取消/到期，再Decode、回收、推进一个Prefill块；末块才选首Token并转入running。预留额度覆盖请求后续增长，不能用当前空闲块数代替。`_retire()`统一释放采样状态、KV和预算。
+`scheduler.py` 按 FIFO 管理等待队列，以单个槽位推进 Prefill，并对运行中的请求合批 Decode。每轮先处理取消和到期，再执行 Decode、回收资源并推进一个 Prefill 块。处理完最后一块后，调度器选出首个 Token，并将仍需生成的请求移入运行队列。准入时预留覆盖请求后续增长的块额度。`_retire()` 统一释放采样状态、KV 和额度。
 
-Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；可用`enable_graphs(max_tokens, batches=(1, 2, 3, 4))`增加真实B2/B3。容量须16对齐；其他批量或超容量回退eager。静态输入/输出和元数据由图持有，每步重写位置与各层块表；返回logits会被下一次重放覆盖。
+Graph 在首次提交前捕获 BF16/V1 模型前向。默认捕获 B1，批量上限至少为 4 时默认再捕获 B4。批量上限允许时，可调用 `enable_graphs(max_tokens, batches=(1, 2, 3, 4))` 分别捕获四种实际批量。捕获容量以 16 Token 对齐，超出容量或遇到未捕获的批量时回退 eager。Graph 持有固定地址的输入、输出和元数据缓冲区。每步更新位置和各层块表，下一次重放会覆盖本次返回的 logits。
 
-`prefill_chunk_size=0`保持整段，正值每轮推进一块。后续块使用`j ≤ history+i`偏移因果掩码；Prefill不进Graph。混合前向共用投影和MLP，Attention仍按请求独立，与Graph分开启用。配置与接口见[README](../README.MD)，取舍见[动态负载报告](BENCHMARK.md#动态到达负载与分块取舍)。
+`prefill_chunk_size=0` 执行整段 Prefill。设为正数时，每轮按该大小推进一个块，后续块使用偏移因果掩码 `j ≤ history+i`。同步调度的 Graph 只捕获 Decode。混合前向合并投影和 MLP，Attention 按请求独立执行。混合前向和 Graph 分开启用。配置见 [README](../README.MD)，实测取舍见[动态负载报告](BENCHMARK.md#动态到达负载与分块取舍)。
 
 ## 跨轮流水
 
@@ -53,9 +53,9 @@ Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；可用`enable_g
 
 ## 请求级采样
 
-`RequestSampler`在提交时校验temperature/top-k/seed。每请求私有CPU Generator产生N个FP32 uniform并上传，占`4N`字节，退休时释放。位置0为Prefill首Token；同步按已提交输出数索引，流水按`flight.targets-1`索引，前瞻丢弃不推进共享随机游标。
+`RequestSampler` 在提交时校验温度、top-k 和种子。随机采样使用每请求独立的 CPU Generator，把 N 个 FP32 均匀随机数上传到 GPU，占 `4N` 字节，随请求资源一起释放。首个输出 Token 使用位置 0。同步路径按已提交输出数取值，流水按 `flight.targets-1` 取值。两条路径都直接按位置索引，因此丢弃前瞻结果时无需调整随机数游标。
 
-选词在模型图外进行：分数降序、同分Token ID升序，选足top-k后稳定softmax；已有FP32概率用FP64累计，除以实际总量后转回FP32 CDF，零概率尾部平坦，末端为1。固定环境、后端、参数和位置可复现；不同后端可在CDF移动分界处选中不同候选。
+选词在模型图外执行。候选按分数降序排列，同分时按 Token ID 升序排列。选出 top-k 后做稳定 softmax，以 FP64 累计 FP32 概率，再除以实际总量并转回 FP32 CDF。零概率尾部保持平坦，CDF 末端为 1。后端之间的数值差异可能移动 CDF 分界，从而改变分界附近的选词。
 
 默认`reference`使用稳定排序。显式`cuda`支持同K的B1/B4、K40/128、FP32/BF16和V≤524288，其他组合回退参考。CUDA将大词表分段缩减为小候选，再融合温度、softmax、CDF和选词；全greedy使用argmax。CUDA与参考共用请求随机流，临时组批/分配在图外、当前流执行。
 
@@ -65,7 +65,7 @@ Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；可用`enable_g
 
 `speculative_decode.py`独立驱动8B目标与0.6B草稿，保持各自层数、权重、RoPE和KV池。轮首KV不含最后一个已提交Token（pending）；草稿用pending连续提议K个候选，目标一次输入pending和候选，返回K+1个预测位置。
 
-提交最长匹配前缀及一个目标修正/额外Token，按EOS和剩余预算裁切。两套KV截断到实际提交长度；全接受时，草稿需真实补算最后一个尚未写入KV的候选。最后提交的Token继续作为下一轮pending。
+先取最长匹配前缀。首次不匹配时追加目标模型的修正 Token，全匹配时追加目标模型的额外 Token，再按 EOS 和剩余预算裁切。两套 KV 保留到本轮最后一个新提交 Token 之前。全接受且需要补齐草稿缓存时，草稿对缺少 KV 的候选实际执行一次前向。最后提交的 Token 成为下一轮 pending。
 
 `speculative_draft.DraftGraph`组合既有B1 Graph，独占28层固定池。GPU argmax在图外同流执行，各候选写独立槽，下一步直接读取设备Token；目标验证后一次取回候选与预测。最多四个起草上传槽和一个补算槽，统一取词完成后再复用；结束等待当前流并归还逻辑块，物理池和图跨请求常驻。reference/cuda后端沿用相同接受与回收逻辑。
 
@@ -73,6 +73,6 @@ Graph在首次提交前捕获BF16/V1模型前向，默认B1/B4；可用`enable_g
 
 `structured_output.py`通过可选XGrammar 0.1.18公开API编译Schema；编译结果可复用，每请求独占matcher与CPU/GPU bitmask。真实tokenizer和模型词表共同定义合法编号，补齐编号被排除；图外选词前将非法logits设为负无穷，零合法项直接报错。
 
-支持同步eager/Graph与reference/CUDA采样，提交时拒绝流水、mixed、分块及ignore_eos。`_commit`对实际Token调用一次accept_token，EOS标记完整、生成上限标记截断；`_retire`释放matcher及掩码。普通请求不导入XGrammar。接口参考[DeepInfer结构化输出](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/structure_output)。
+结构化请求使用整段 Prefill、正常 EOS、同步 eager 或 Graph，以及 reference 或 CUDA 采样。提交入口会拒绝流水、mixed、分块和 `ignore_eos` 组合。`_commit` 对实际提交的 Token 调用一次 `accept_token`。EOS 标记语法完整，达到生成上限标记截断。`_retire` 释放 matcher 和掩码。XGrammar 在结构化请求需要编译语法时加载。接口参考 [DeepInfer 结构化输出](https://github.com/deepseek-ai/DeepInfer/tree/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/structure_output)。
 
 `runner --mode check`为HF逐步对照，`check_model`覆盖CUDA/INT8模型；调度、分块、Graph、流水、采样和语法各有`check_*`入口。`bench_external`测离线整批，`bench_workload`测闭环与流水，`bench_arrivals`测预定到达，`profile_arrivals`定位阶段，`paged_decode --benchmark`测算子调用。命令与测试表见[README](../README.MD)，配置和数据集中在[性能报告](BENCHMARK.md)。
